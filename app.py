@@ -95,8 +95,6 @@ if st.sidebar.button("🔄 Check & Refresh All Keys", use_container_width=True):
 
 st.sidebar.markdown(f"**🟢 Active Keys:** `{active_keys_count} / {total_keys_count}`")
 
-chunk_size = 2
-
 total_calls_left = 0
 for i in range(total_keys_count):
     if not st.session_state["key_status"][i]["exhausted"]:
@@ -150,7 +148,33 @@ def parse_metadata_from_name(name_str):
 
     return exam, state, date, shift
 
-# 4. Universal Smart Deduplication Engine
+# 4. Intelligent Text Chunker (Question-Aware Boundary Splitter)
+def split_text_by_question_boundaries(text: str, max_questions_per_chunk: int = 4) -> list:
+    """
+    ప్రశ్నలను మధ్యలో కట్ చేయకుండా, నంబర్ల బౌండరీల ప్రకారం ఖచ్చితంగా 3-4 ప్రశ్నల చొప్పున విడదీస్తుంది.
+    """
+    pattern = r'(?=(?:\n|^)\s*(?:Q\.?\s*\d+[\.:\)]|\bQ\d+[\.:\)]|\d{1,3}[\.\)]|\bQuestion\s*[\d\:]+))'
+    parts = re.split(pattern, text, flags=re.IGNORECASE)
+    
+    valid_parts = [p.strip() for p in parts if p.strip()]
+    if not valid_parts:
+        return [text]
+    
+    chunks = []
+    current_chunk = []
+    
+    for part in valid_parts:
+        current_chunk.append(part)
+        if len(current_chunk) >= max_questions_per_chunk:
+            chunks.append("\n\n".join(current_chunk))
+            current_chunk = []
+            
+    if current_chunk:
+        chunks.append("\n\n".join(current_chunk))
+        
+    return chunks
+
+# 5. Universal Smart Deduplication Engine
 BOILERPLATE_PATTERNS = [
     r'read\s+(the\s+)?(below|following)\s+statements?',
     r'mark\s+the\s+following\s+statements?',
@@ -269,23 +293,25 @@ def clean_json_response(raw_text):
     text = re.sub(r'\s*```$', '', text)
     return text.strip()
 
-# 5. High-Recall Multi-Language System Prompt
+# 6. High-Recall Multi-Language System Prompt with Science Safety
 system_instruction = """
 You are an expert Indian competitive exam analyzer and multilingual parser (UPSC, SSC CGL, TSPSC, APPSC, RRB).
 
 CORE EXTRACTION RULES:
 1. STRICTLY IGNORE:
-   - Pure Math / Quantitative Aptitude (Algebra, Geometry, Trigonometry, Arithmetic word problems).
+   - Pure Math / Quantitative Aptitude (Algebra, Geometry, Trigonometry, Arithmetic calculation puzzles).
    - Pure Non-Verbal & Logical Reasoning puzzles (Number/Letter Series, Blood Relations, Coding-Decoding, Syllogisms).
    - Pure English Grammar & Comprehension passages.
 
 2. EXTRACT 100% OF ALL GENERAL KNOWLEDGE / GENERAL STUDIES (GS) QUESTIONS:
    - Indian Polity & Constitution, History & National Movement, Geography, Economy, Science & Tech, Environment, Current Affairs.
    - ALL Formats MUST be extracted: Assertion & Reason (A&R), Match List-I & II, Statements (1 only, 2 only, Both, Neither), Chronology.
-   - CRITICAL: If a question started previously and finishes later, RECONSTRUCT IT COMPLETELY with all options and assertions.
+
+3. PRESERVE SCIENCE & MATH SYMBOLS 100% INTACT:
+   - NEVER alter, drop, or mess up physics dimensional units (e.g., [M^1 L^2 T^-2]), brackets, chemical compounds (e.g., H2SO4, FeSO4), Greek letters (Ω, μ, λ, α, β), or square roots/exponents. Keep them mathematically accurate.
 
 LANGUAGE RULES:
-- VERBATIM EXTRACTION: If a language (English, Telugu, or Hindi) is already present, extract it 100% word-for-word exactly as printed. Do NOT re-phrase or re-write.
+- VERBATIM EXTRACTION: If a language (English, Telugu, or Hindi) is already present, extract it 100% word-for-word exactly as printed. Do NOT re-phrase.
 - ACADEMIC TRANSLATION: For missing languages, provide natural academic translations (Telugu Academy style / NCERT standard).
 - All questions MUST contain all 3 language keys ("en", "te", "hi") for question, options, and explanation.
 
@@ -305,7 +331,7 @@ OUTPUT FORMAT: Strict valid JSON array of objects without markdown backticks.
 ]
 """
 
-# 6. Fault-Tolerant AI Engine (gemini-3.6-flash)
+# 7. Fault-Tolerant AI Engine (gemini-3.6-flash)
 def generate_with_smart_fallback(file_part, prompt_text, live_status_box, max_retries=12):
     for attempt in range(max_retries):
         current_client, key_idx, key_name = get_next_available_client()
@@ -344,7 +370,7 @@ def generate_with_smart_fallback(file_part, prompt_text, live_status_box, max_re
                 
     raise Exception("గరిష్ట రీట్రైల తర్వాత కూడా సర్వర్ రెస్పాన్స్ ఇవ్వలేదు.")
 
-# 7. Dual Input Interface (Upload vs Direct Paste)
+# 8. Dual Input Interface (Upload vs Direct Paste)
 tab_upload, tab_paste = st.tabs(["📄 Upload File (PDF / TXT)", "📋 Direct Paste Text (Ultra-Fast)"])
 
 detected_meta = {"exam": "", "state": "", "date": "", "shift": ""}
@@ -356,21 +382,21 @@ with tab_upload:
         detected_meta = {"exam": e, "state": s, "date": d, "shift": sh}
 
 with tab_paste:
-    st.caption("⚡ PDF నుండి కాపీ చేసిన లేదా AI తో కన్వర్ట్ చేసిన టెక్స్ట్‌ను నేరుగా ఇక్కడ పేస్ట్ చేయండి.")
+    st.caption("⚡ PDF నుండి కాపీ చేసిన టెక్స్ట్‌ను నేరుగా ఇక్కడ పేస్ట్ చేయండి.")
     paper_title = st.text_input("Paper Name / Reference (Optional)", placeholder="e.g. SSC_CGL_2024_09_12_Shift1")
     pasted_text_input = st.text_area("Paste Question Paper Text Here", height=240, placeholder="Paste questions text here (Ctrl + V)...")
     if paper_title:
         e, s, d, sh = parse_metadata_from_name(paper_title)
         detected_meta = {"exam": e, "state": s, "date": d, "shift": sh}
 
-# Sidebar Metadata Inputs (Auto-filled & Editable)
+# Sidebar Metadata Inputs
 st.sidebar.header("📝 Exam Metadata")
 manual_exam_name = st.sidebar.text_input("Exam Name", value=detected_meta["exam"])
 manual_state = st.sidebar.text_input("State", value=detected_meta["state"])
 manual_date = st.sidebar.text_input("Date", value=detected_meta["date"])
 manual_shift = st.sidebar.text_input("Shift", value=detected_meta["shift"])
 
-# 8. Execution Pipeline
+# 9. Execution Pipeline
 st.markdown("<br>", unsafe_allow_html=True)
 btn_col1, btn_col2 = st.columns([3, 7])
 
@@ -387,22 +413,21 @@ if start_process:
         live_status_box = st.empty()
 
         try:
-            # SCENARIO A: Direct Pasted Text Execution
+            # SCENARIO A: Direct Pasted Text Execution (Boundary-Aware)
             if pasted_text_input and pasted_text_input.strip():
                 clean_raw_text = pasted_text_input.strip()
-                status_text.markdown("⏳ **Processing Pasted Text with AI...**")
+                status_text.markdown("⏳ **Analyzing Question Boundaries...**")
                 
-                # Split large text into ~4500 character safe chunks to protect output token limit
-                chunk_len = 4500
-                text_slices = [clean_raw_text[i:i+chunk_len] for i in range(0, len(clean_raw_text), chunk_len)]
-                total_slices = len(text_slices)
+                # Split intelligently by question boundaries (3-4 questions per chunk)
+                text_chunks = split_text_by_question_boundaries(clean_raw_text, max_questions_per_chunk=4)
+                total_slices = len(text_chunks)
 
-                for s_idx, t_chunk in enumerate(text_slices):
-                    status_text.markdown(f"⏳ **Processing Text Batch {s_idx + 1} of {total_slices}...**")
+                for s_idx, t_chunk in enumerate(text_chunks):
+                    status_text.markdown(f"⏳ **Processing Question Batch {s_idx + 1} of {total_slices}...**")
                     file_part = types.Part.from_bytes(data=t_chunk.encode("utf-8"), mime_type="text/plain")
                     raw_resp, used_key_name = generate_with_smart_fallback(
                         file_part=file_part,
-                        prompt_text="Extract all GK questions following verbatim and academic translation rules.",
+                        prompt_text="Extract all GK questions following verbatim, science symbol preservation, and academic translation rules.",
                         live_status_box=live_status_box
                     )
                     clean_json_str = clean_json_response(raw_resp)
@@ -451,7 +476,7 @@ if start_process:
 
                         raw_resp, used_key_name = generate_with_smart_fallback(
                             file_part=file_part,
-                            prompt_text="Extract all GK questions following verbatim, boundary reconstruction, and translation rules.",
+                            prompt_text="Extract all GK questions following verbatim, science symbol preservation, boundary reconstruction, and translation rules.",
                             live_status_box=live_status_box
                         )
 
@@ -491,7 +516,7 @@ if start_process:
         except Exception as e:
             st.error(f"Error during AI processing: {e}")
 
-# 9. Multilingual Preview & Supabase Save
+# 10. Multilingual Preview & Supabase Save
 if "extracted_questions" in st.session_state and st.session_state["extracted_questions"]:
     questions_data = st.session_state["extracted_questions"]
 
