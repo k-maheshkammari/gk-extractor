@@ -46,6 +46,12 @@ if "key_status" not in st.session_state:
 if "round_robin_idx" not in st.session_state:
     st.session_state["round_robin_idx"] = 0
 
+if "raw_scanned_questions" not in st.session_state:
+    st.session_state["raw_scanned_questions"] = []
+
+if "extracted_questions" not in st.session_state:
+    st.session_state["extracted_questions"] = []
+
 def get_key_display(idx):
     k = gemini_keys_raw[idx]
     return f"Key {idx + 1} (...{k[-6:]})"
@@ -78,11 +84,10 @@ def get_next_available_client():
     
     return genai.Client(api_key=selected_key), current_idx, get_key_display(current_idx)
 
-# 2. UI Layout
-st.set_page_config(page_title="Smart GK Extractor & Live Monitor", layout="wide")
-st.title("📚 Smart GK Extractor & Auto-Translator (En | Te | Hi)")
+# 2. UI Layout & Sidebar Monitor
+st.set_page_config(page_title="Industrial GK Extractor & Live Monitor", layout="wide")
+st.title("📚 Industrial GK Extractor & Auto-Translator (En | Te | Hi)")
 
-# Sidebar Monitor
 st.sidebar.header("📊 Live Quota & Capacity Monitor")
 active_keys_count = sum(1 for v in st.session_state["key_status"].values() if not v["exhausted"])
 total_keys_count = len(gemini_keys_raw)
@@ -115,7 +120,7 @@ with st.sidebar.expander("🔑 Individual Key Status", expanded=False):
 
 st.sidebar.divider()
 
-# 3. Filename & Title Metadata Extractor
+# 3. Metadata Extractor
 def parse_metadata_from_name(name_str):
     name = (name_str or "").lower()
     exam = "General Exam"
@@ -148,141 +153,6 @@ def parse_metadata_from_name(name_str):
 
     return exam, state, date, shift
 
-# 4. Intelligent Text Chunker (Question-Aware Boundary Splitter)
-def split_text_by_question_boundaries(text: str, max_questions_per_chunk: int = 4) -> list:
-    """
-    ప్రశ్నలను మధ్యలో కట్ చేయకుండా, నంబర్ల బౌండరీల ప్రకారం ఖచ్చితంగా 3-4 ప్రశ్నల చొప్పున విడదీస్తుంది.
-    """
-    pattern = r'(?=(?:\n|^)\s*(?:Q\.?\s*\d+[\.:\)]|\bQ\d+[\.:\)]|\d{1,3}[\.\)]|\bQuestion\s*[\d\:]+))'
-    parts = re.split(pattern, text, flags=re.IGNORECASE)
-    
-    valid_parts = [p.strip() for p in parts if p.strip()]
-    if not valid_parts:
-        return [text]
-    
-    chunks = []
-    current_chunk = []
-    
-    for part in valid_parts:
-        current_chunk.append(part)
-        if len(current_chunk) >= max_questions_per_chunk:
-            chunks.append("\n\n".join(current_chunk))
-            current_chunk = []
-            
-    if current_chunk:
-        chunks.append("\n\n".join(current_chunk))
-        
-    return chunks
-
-# 5. Universal Smart Deduplication Engine
-BOILERPLATE_PATTERNS = [
-    r'read\s+(the\s+)?(below|following)\s+statements?',
-    r'mark\s+the\s+following\s+statements?',
-    r'which\s+of\s+the\s+following(\s+statements?)?(\s+regarding[a-z\s]+)?(\s+is|\s+are|\s+correctly)?\s*(correct|true|false|reflects|evolution)?',
-    r'assertion\s*\([a-z]\):?',
-    r'reason\s*\([a-z]\):?',
-    r'mark\s+the\s+correct\s+option[s]?',
-    r'choose\s+the\s+correct\s+(option|answer|code)',
-    r'consider\s+the\s+following\s+(statements?|pairs?)?',
-    r'select\s+the\s+correct\s+answer',
-    r'match\s+list\s*[-–]?\s*[i|1]\s+with\s+list\s*[-–]?\s*[i|2]',
-    r'క్రింది\s*(వాక్యాలను|ప్రకటనలను)\s*పరిశీలించండి',
-    r'సరైన\s*(సమాధానాన్ని|ఎంపికను)\s*ఎంచుకోండి'
-]
-
-GENERIC_OPTION_WORDS = {
-    'both', 'and', 'true', 'false', 'correct', 'explanation', 'not', 'neither',
-    'only', 'one', 'two', 'three', 'four', 'statement', 'statements', 'option', 'is', 'are', 'reason', 'assertion'
-}
-
-def clean_boilerplate_text(text: str) -> str:
-    if not text:
-        return ""
-    cleaned = text.lower()
-    for pattern in BOILERPLATE_PATTERNS:
-        cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
-    return cleaned
-
-def extract_core_entity_tokens(text: str) -> set:
-    if not text:
-        return set()
-    cleaned = clean_boilerplate_text(text)
-    words = re.findall(r'[a-zA-Z0-9\u0C00-\u0C7F]{3,}', cleaned)
-    return {w for w in words if w not in GENERIC_OPTION_WORDS}
-
-def extract_substantive_option_tokens(options_dict: dict) -> set:
-    if not isinstance(options_dict, dict):
-        return set()
-    en_opts = options_dict.get("en", options_dict)
-    if not isinstance(en_opts, dict):
-        return set()
-    combined_opts = " ".join(str(v) for v in en_opts.values()).lower()
-    words = re.findall(r'[a-zA-Z0-9]{3,}', combined_opts)
-    return {w for w in words if w not in GENERIC_OPTION_WORDS}
-
-def are_same_question(q1_item, q2_item) -> bool:
-    opt_tokens1 = extract_substantive_option_tokens(q1_item.get("options", {}))
-    opt_tokens2 = extract_substantive_option_tokens(q2_item.get("options", {}))
-    
-    if len(opt_tokens1) >= 3 and len(opt_tokens2) >= 3:
-        opt_inter = len(opt_tokens1 & opt_tokens2)
-        opt_union = len(opt_tokens1 | opt_tokens2)
-        if (opt_inter / opt_union) >= 0.70:
-            return True
-
-    q1_en = q1_item.get("question", {}).get("en", "")
-    q2_en = q2_item.get("question", {}).get("en", "")
-    t1 = extract_core_entity_tokens(q1_en)
-    t2 = extract_core_entity_tokens(q2_en)
-    
-    if t1 and t2:
-        intersection = len(t1 & t2)
-        union = len(t1 | t2)
-        if union > 0 and (intersection / union) >= 0.65 and intersection >= 2:
-            return True
-            
-        c1 = re.sub(r'\s+', ' ', clean_boilerplate_text(q1_en)).strip()
-        c2 = re.sub(r'\s+', ' ', clean_boilerplate_text(q2_en)).strip()
-        if len(c1) > 20 and len(c2) > 20:
-            if SequenceMatcher(None, c1, c2).ratio() >= 0.78:
-                return True
-
-    q1_te = q1_item.get("question", {}).get("te", "")
-    q2_te = q2_item.get("question", {}).get("te", "")
-    if q1_te and q2_te:
-        t_te1 = extract_core_entity_tokens(q1_te)
-        t_te2 = extract_core_entity_tokens(q2_te)
-        if t_te1 and t_te2:
-            inter_te = len(t_te1 & t_te2)
-            union_te = len(t_te1 | t_te2)
-            if union_te > 0 and (inter_te / union_te) >= 0.65 and inter_te >= 2:
-                return True
-                
-    return False
-
-def get_question_completeness_score(item) -> int:
-    q_len = len(item.get("question", {}).get("en", ""))
-    exp_len = len(item.get("explanation", {}).get("en", ""))
-    opts_count = len(item.get("options", {}).get("en", {}))
-    return q_len + exp_len + (opts_count * 50)
-
-def deduplicate_and_merge_questions(question_list):
-    unique_questions = []
-    for new_item in question_list:
-        matched_idx = -1
-        for idx, existing_item in enumerate(unique_questions):
-            if are_same_question(new_item, existing_item):
-                matched_idx = idx
-                break
-        
-        if matched_idx == -1:
-            unique_questions.append(new_item)
-        else:
-            if get_question_completeness_score(new_item) > get_question_completeness_score(unique_questions[matched_idx]):
-                unique_questions[matched_idx] = new_item
-                
-    return unique_questions
-
 def clean_json_response(raw_text):
     text = raw_text.strip()
     match = re.search(r'\[\s*\{.*\}\s*\]', text, re.DOTALL)
@@ -293,31 +163,119 @@ def clean_json_response(raw_text):
     text = re.sub(r'\s*```$', '', text)
     return text.strip()
 
-# 6. High-Recall Multi-Language System Prompt with Science Safety
-system_instruction = """
-You are an expert Indian competitive exam analyzer and multilingual parser (UPSC, SSC CGL, TSPSC, APPSC, RRB).
+# 4. Stage 1 Deduplication & Entity Normalizer
+BOILERPLATE_PATTERNS = [
+    r'which\s+of\s+the\s+following(\s+statements?)?(\s+regarding[a-z\s]+)?(\s+is|\s+are|\s+correctly)?\s*(correct|true|false|reflects|evolution)?',
+    r'read\s+(the\s+)?(below|following)\s+statements?',
+    r'fill\s+in\s+the\s+blanks?(\s*:\s*)?',
+    r'assertion\s*\([a-z]\):?',
+    r'reason\s*\([a-z]\):?',
+    r'choose\s+the\s+correct\s+(option|answer|code)',
+    r'select\s+the\s+correct\s+answer',
+    r'match\s+list\s*[-–]?\s*[i|1]\s+with\s+list\s*[-–]?\s*[i|2]',
+    r'निम्नलिखित\s+में\s+से\s+कौन\s+सा\s+कथन\s+सही\s+है\??',
+    r'रिक्त\s+स्थान\s+भरें\s*:\s*',
+    r'नीचे\s+अभिकथन\s*\(a\)\s+और\s+कारण\s*\(r\)\s+दिए\s+गए\s+हैं\।?',
+    r'క్రింది\s*(వాక్యాలను|ప్రకటనలను)\s*పరిశీలించండి',
+    r'సరైన\s*(సమాధానాన్ని|ఎంపికను)\s*ఎంచుకోండి'
+]
 
-CORE EXTRACTION RULES:
-1. STRICTLY IGNORE:
-   - Pure Math / Quantitative Aptitude (Algebra, Geometry, Trigonometry, Arithmetic calculation puzzles).
-   - Pure Non-Verbal & Logical Reasoning puzzles (Number/Letter Series, Blood Relations, Coding-Decoding, Syllogisms).
-   - Pure English Grammar & Comprehension passages.
+GENERIC_WORDS = {
+    'both', 'and', 'true', 'false', 'correct', 'explanation', 'not', 'neither',
+    'only', 'one', 'two', 'three', 'four', 'statement', 'statements', 'option', 
+    'options', 'following', 'regarding', 'refers', 'which', 'what', 'when', 'where'
+}
 
-2. EXTRACT 100% OF ALL GENERAL KNOWLEDGE / GENERAL STUDIES (GS) QUESTIONS:
-   - Indian Polity & Constitution, History & National Movement, Geography, Economy, Science & Tech, Environment, Current Affairs.
-   - ALL Formats MUST be extracted: Assertion & Reason (A&R), Match List-I & II, Statements (1 only, 2 only, Both, Neither), Chronology.
+def extract_tokens(text: str) -> set:
+    if not text:
+        return set()
+    cleaned = text.lower()
+    for p in BOILERPLATE_PATTERNS:
+        cleaned = re.sub(p, ' ', cleaned, flags=re.IGNORECASE)
+    words = re.findall(r'[a-zA-Z0-9\u0900-\u097F\u0C00-\u0C7F]{3,}', cleaned)
+    return {w for w in words if w not in GENERIC_WORDS}
 
-3. PRESERVE SCIENCE & MATH SYMBOLS 100% INTACT:
-   - NEVER alter, drop, or mess up physics dimensional units (e.g., [M^1 L^2 T^-2]), brackets, chemical compounds (e.g., H2SO4, FeSO4), Greek letters (Ω, μ, λ, α, β), or square roots/exponents. Keep them mathematically accurate.
+def are_raw_questions_duplicate(q1: dict, q2: dict) -> bool:
+    t1 = extract_tokens(q1.get("raw_question", ""))
+    t2 = extract_tokens(q2.get("raw_question", ""))
+    
+    if t1 and t2:
+        inter = len(t1 & t2)
+        union = len(t1 | t2)
+        if union > 0 and (inter / union) >= 0.55 and inter >= 2:
+            return True
+            
+    opts1_str = " ".join(str(v) for v in q1.get("raw_options", {}).values())
+    opts2_str = " ".join(str(v) for v in q2.get("raw_options", {}).values())
+    opt_t1 = extract_tokens(opts1_str)
+    opt_t2 = extract_tokens(opts2_str)
+    
+    if len(opt_t1) >= 3 and len(opt_t2) >= 3:
+        opt_inter = len(opt_t1 & opt_t2)
+        opt_union = len(opt_t1 | opt_t2)
+        if opt_union > 0 and (opt_inter / opt_union) >= 0.60:
+            return True
+            
+    return False
 
-LANGUAGE RULES:
-- VERBATIM EXTRACTION: If a language (English, Telugu, or Hindi) is already present, extract it 100% word-for-word exactly as printed. Do NOT re-phrase.
-- ACADEMIC TRANSLATION: For missing languages, provide natural academic translations (Telugu Academy style / NCERT standard).
-- All questions MUST contain all 3 language keys ("en", "te", "hi") for question, options, and explanation.
+def get_raw_completeness(q: dict) -> int:
+    q_len = len(q.get("raw_question", ""))
+    opts_len = sum(len(str(v)) for v in q.get("raw_options", {}).values())
+    ans_score = 50 if q.get("detected_answer") else 0
+    return q_len + opts_len + ans_score
 
-OUTPUT FORMAT: Strict valid JSON array of objects without markdown backticks.
+def deduplicate_raw_scanned_list(raw_list: list) -> list:
+    unique_list = []
+    for item in raw_list:
+        matched_idx = -1
+        for idx, existing in enumerate(unique_list):
+            if are_raw_questions_duplicate(item, existing):
+                matched_idx = idx
+                break
+        if matched_idx == -1:
+            unique_list.append(item)
+        else:
+            if get_raw_completeness(item) > get_raw_completeness(unique_list[matched_idx]):
+                unique_list[matched_idx] = item
+    return unique_list
+
+# 5. System Prompts (Two-Stage Architecture)
+stage1_system_prompt = """
+You are a High-Recall Indian Competitive Exam Question Filter and Boundary Detector.
+TASK: Extract ONLY General Knowledge (GK) / General Studies (GS) questions from the given input.
+
+STRICT FILTER RULES:
+1. IGNORE completely: Pure Math/Quantitative Aptitude (Trigonometry, Algebra, Arithmetic calculation problems), Pure Logical Reasoning / Number / Letter Series puzzles, Pure English Grammar / Comprehension passages.
+2. EXTRACT 100% GK/GS: History, Polity & Constitution, Geography, Economy, General Science (Physics, Chemistry, Biology), Environment, Art & Culture, Current Affairs.
+3. ALL QUESTION TYPES MUST BE EXTRACTED: Statement 1 & 2, Assertion & Reason (A&R), Match List-I & II, Chronology, Fill in the Blanks.
+4. PRESERVE SCIENCE & FORMULAS 100% INTACT: Formulas ([M^1 L^2 T^-2], H2SO4, FeSO4), Greek symbols (Ω, μ, λ, α, β), superscripts/subscripts. Do NOT drop brackets or equations.
+5. Keep the raw_question and raw_options verbatim as printed (including multilingual text if both English & Hindi/Telugu are in the source).
+
+OUTPUT FORMAT: Strict JSON array of objects without markdown backticks:
 [
   {
+    "raw_question": "...",
+    "raw_options": {"A": "...", "B": "...", "C": "...", "D": "..."},
+    "detected_answer": "A" // or null if not indicated
+  }
+]
+"""
+
+stage2_system_prompt = """
+You are an expert Multilingual Translator & Academic Exam Solution Generator (NCERT / Telugu Academy Standard).
+TASK: Take the provided GK questions and enrich them with full 3-language translations, verified correct answer, comprehensive explanation, and meta tags.
+
+RULES:
+1. PRESERVE SCIENCE & MATH SYMBOLS 100%: Keep physics units ([M^1 L^2 T^-2]), chemical formulas (H2SO4, FeSO4), Greek symbols (Ω, μ, λ) 100% mathematically accurate across all languages.
+2. VERBATIM & ACADEMIC TRANSLATION: If a language is already present, keep it verbatim. For missing languages, generate standard academic translations.
+3. SOLVE/CONFIRM CORRECT ANSWER: Determine the verified correct answer ("A", "B", "C", or "D").
+4. COMPREHENSIVE EXPLANATION: Write detailed, accurate explanations in English, Telugu, and Hindi.
+5. All 3 language keys ("en", "te", "hi") are MANDATORY for question, options, and explanation.
+
+OUTPUT FORMAT: Strict JSON array of objects without markdown backticks:
+[
+  {
+    "id": 1,
     "question": {"en": "...", "te": "...", "hi": "..."},
     "options": {
       "en": {"A": "...", "B": "...", "C": "...", "D": "..."},
@@ -331,8 +289,8 @@ OUTPUT FORMAT: Strict valid JSON array of objects without markdown backticks.
 ]
 """
 
-# 7. Fault-Tolerant AI Engine (gemini-3.6-flash)
-def generate_with_smart_fallback(file_part, prompt_text, live_status_box, max_retries=12):
+# 6. Fault-Tolerant AI Engine
+def generate_with_smart_fallback(file_part, prompt_text, sys_instruction, live_status_box, max_retries=12):
     for attempt in range(max_retries):
         current_client, key_idx, key_name = get_next_available_client()
         if not current_client:
@@ -345,7 +303,7 @@ def generate_with_smart_fallback(file_part, prompt_text, live_status_box, max_re
                 model="gemini-3.6-flash",
                 contents=[file_part, prompt_text],
                 config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
+                    system_instruction=sys_instruction,
                     response_mime_type="application/json",
                     temperature=0.0
                 )
@@ -370,7 +328,7 @@ def generate_with_smart_fallback(file_part, prompt_text, live_status_box, max_re
                 
     raise Exception("గరిష్ట రీట్రైల తర్వాత కూడా సర్వర్ రెస్పాన్స్ ఇవ్వలేదు.")
 
-# 8. Dual Input Interface (Upload vs Direct Paste)
+# 7. Dual Input Interface
 tab_upload, tab_paste = st.tabs(["📄 Upload File (PDF / TXT)", "📋 Direct Paste Text (Ultra-Fast)"])
 
 detected_meta = {"exam": "", "state": "", "date": "", "shift": ""}
@@ -384,142 +342,219 @@ with tab_upload:
 with tab_paste:
     st.caption("⚡ PDF నుండి కాపీ చేసిన టెక్స్ట్‌ను నేరుగా ఇక్కడ పేస్ట్ చేయండి.")
     paper_title = st.text_input("Paper Name / Reference (Optional)", placeholder="e.g. SSC_CGL_2024_09_12_Shift1")
-    pasted_text_input = st.text_area("Paste Question Paper Text Here", height=240, placeholder="Paste questions text here (Ctrl + V)...")
+    pasted_text_input = st.text_area("Paste Question Paper Text Here", height=220, placeholder="Paste questions text here (Ctrl + V)...")
     if paper_title:
         e, s, d, sh = parse_metadata_from_name(paper_title)
         detected_meta = {"exam": e, "state": s, "date": d, "shift": sh}
 
-# Sidebar Metadata Inputs
+# Sidebar Metadata
 st.sidebar.header("📝 Exam Metadata")
 manual_exam_name = st.sidebar.text_input("Exam Name", value=detected_meta["exam"])
 manual_state = st.sidebar.text_input("State", value=detected_meta["state"])
 manual_date = st.sidebar.text_input("Date", value=detected_meta["date"])
 manual_shift = st.sidebar.text_input("Shift", value=detected_meta["shift"])
 
-# 9. Execution Pipeline
 st.markdown("<br>", unsafe_allow_html=True)
-btn_col1, btn_col2 = st.columns([3, 7])
 
-with btn_col1:
-    start_process = st.button("🚀 Smart Extract & Process (En, Te, Hi)", type="primary", use_container_width=True)
+# 8. STAGE 1: Universal Scan & Deduplicated Extraction (Gatekeeper)
+col_step1, col_step2 = st.columns([1, 1])
 
-if start_process:
+with col_step1:
+    btn_scan = st.button("🔍 1. Scan & Identify Raw GK Questions", type="primary", use_container_width=True)
+
+if btn_scan:
     if active_keys_count == 0:
         st.error("అన్ని API కీలు కోటా తాకాయి. దయచేసి కాసేపటి తర్వాత ప్రయత్నించండి.")
     else:
-        raw_extracted_questions = []
+        st.session_state["raw_scanned_questions"] = []
+        st.session_state["extracted_questions"] = []
+        
+        status_box = st.empty()
+        live_box = st.empty()
         progress_bar = st.progress(0)
-        status_text = st.empty()
-        live_status_box = st.empty()
-
+        
         try:
-            # SCENARIO A: Direct Pasted Text Execution (Boundary-Aware)
+            scanned_raw = []
+            
+            # SCENARIO A: Direct Pasted Text
             if pasted_text_input and pasted_text_input.strip():
-                clean_raw_text = pasted_text_input.strip()
-                status_text.markdown("⏳ **Analyzing Question Boundaries...**")
+                raw_text = pasted_text_input.strip()
+                status_box.markdown("⏳ **Scanning pasted text for GK questions...**")
                 
-                # Split intelligently by question boundaries (3-4 questions per chunk)
-                text_chunks = split_text_by_question_boundaries(clean_raw_text, max_questions_per_chunk=4)
-                total_slices = len(text_chunks)
-
-                for s_idx, t_chunk in enumerate(text_chunks):
-                    status_text.markdown(f"⏳ **Processing Question Batch {s_idx + 1} of {total_slices}...**")
-                    file_part = types.Part.from_bytes(data=t_chunk.encode("utf-8"), mime_type="text/plain")
-                    raw_resp, used_key_name = generate_with_smart_fallback(
+                chunk_len = 5000
+                slices = [raw_text[i:i+chunk_len] for i in range(0, len(raw_text), chunk_len)]
+                for idx, sl in enumerate(slices):
+                    file_part = types.Part.from_bytes(data=sl.encode("utf-8"), mime_type="text/plain")
+                    resp, _ = generate_with_smart_fallback(
                         file_part=file_part,
-                        prompt_text="Extract all GK questions following verbatim, science symbol preservation, and academic translation rules.",
-                        live_status_box=live_status_box
+                        prompt_text="Extract raw GK questions matching system rules.",
+                        sys_instruction=stage1_system_prompt,
+                        live_status_box=live_box
                     )
-                    clean_json_str = clean_json_response(raw_resp)
-                    if clean_json_str:
-                        try:
-                            parsed_q = json.loads(clean_json_str)
-                            if isinstance(parsed_q, list):
-                                raw_extracted_questions.extend(parsed_q)
-                        except Exception as parse_err:
-                            st.warning(f"JSON Parse Warning in Batch {s_idx + 1}: {parse_err}")
-
-                    progress_bar.progress((s_idx + 1) / total_slices)
-                    time.sleep(0.4)
-
-            # SCENARIO B: Uploaded File Execution (PDF / TXT)
+                    clean_str = clean_json_response(resp)
+                    if clean_str:
+                        parsed = json.loads(clean_str)
+                        if isinstance(parsed, list):
+                            scanned_raw.extend(parsed)
+                    progress_bar.progress((idx + 1) / len(slices))
+                    
+            # SCENARIO B: Uploaded PDF / TXT
             elif uploaded_file is not None:
                 if uploaded_file.name.endswith(".pdf"):
                     pdf_bytes = uploaded_file.read()
                     pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
                     total_pages = len(pdf_reader.pages)
-
-                    page_slices = []
-                    curr = 0
-                    while curr < total_pages:
-                        nxt = min(curr + 2, total_pages)
-                        page_slices.append((curr, nxt))
-                        if nxt == total_pages:
-                            break
-                        curr += 1
+                    
+                    # 1. Try Digital Text Stream Extraction First (Zero Page Split Loss)
+                    full_digital_text = ""
+                    for p in pdf_reader.pages:
+                        t = p.extract_text() or ""
+                        full_digital_text += t + "\n"
                         
-                    total_chunks = len(page_slices)
-
-                    for chunk_idx, (slice_start, slice_end) in enumerate(page_slices):
-                        status_text.markdown(f"⏳ **Processing Pages {slice_start + 1} to {slice_end} of {total_pages}** (Batch {chunk_idx + 1}/{total_chunks})...")
-
-                        writer = PdfWriter()
-                        for p in range(slice_start, slice_end):
-                            if p < len(pdf_reader.pages):
+                    if len(full_digital_text.strip()) > 300:
+                        status_box.markdown("⚡ **Digital PDF Detected: Processing continuous text stream...**")
+                        chunk_len = 5500
+                        slices = [full_digital_text[i:i+chunk_len] for i in range(0, len(full_digital_text), chunk_len)]
+                        for idx, sl in enumerate(slices):
+                            file_part = types.Part.from_bytes(data=sl.encode("utf-8"), mime_type="text/plain")
+                            resp, _ = generate_with_smart_fallback(
+                                file_part=file_part,
+                                prompt_text="Extract raw GK questions matching system rules.",
+                                sys_instruction=stage1_system_prompt,
+                                live_status_box=live_box
+                            )
+                            clean_str = clean_json_response(resp)
+                            if clean_str:
+                                parsed = json.loads(clean_str)
+                                if isinstance(parsed, list):
+                                    scanned_raw.extend(parsed)
+                            progress_bar.progress((idx + 1) / len(slices))
+                    else:
+                        # 2. Fallback to Byte Slices for Scanned / Image-heavy PDFs
+                        status_box.markdown(f"📄 **Scanning {total_pages} PDF Pages...**")
+                        page_slices = []
+                        curr = 0
+                        while curr < total_pages:
+                            nxt = min(curr + 3, total_pages)
+                            page_slices.append((curr, nxt))
+                            if nxt == total_pages:
+                                break
+                            curr += 2  # Safe overlap for boundary reconstruction
+                            
+                        for c_idx, (p_start, p_end) in enumerate(page_slices):
+                            status_box.markdown(f"⏳ **Scanning Pages {p_start+1} to {p_end} of {total_pages}...**")
+                            writer = PdfWriter()
+                            for p in range(p_start, p_end):
                                 writer.add_page(pdf_reader.pages[p])
-                        
-                        chunk_stream = io.BytesIO()
-                        writer.write(chunk_stream)
-                        chunk_bytes = chunk_stream.getvalue()
-
-                        file_part = types.Part.from_bytes(data=chunk_bytes, mime_type="application/pdf")
-
-                        raw_resp, used_key_name = generate_with_smart_fallback(
-                            file_part=file_part,
-                            prompt_text="Extract all GK questions following verbatim, science symbol preservation, boundary reconstruction, and translation rules.",
-                            live_status_box=live_status_box
-                        )
-
-                        clean_json_str = clean_json_response(raw_resp)
-                        if clean_json_str:
-                            try:
-                                chunk_questions = json.loads(clean_json_str)
-                                if isinstance(chunk_questions, list):
-                                    raw_extracted_questions.extend(chunk_questions)
-                            except Exception as parse_err:
-                                st.warning(f"JSON Parse Warning in Batch {chunk_idx + 1}: {parse_err}")
-
-                        progress_bar.progress((chunk_idx + 1) / total_chunks)
-                        time.sleep(0.5)
-
+                            stream = io.BytesIO()
+                            writer.write(stream)
+                            
+                            file_part = types.Part.from_bytes(data=stream.getvalue(), mime_type="application/pdf")
+                            resp, _ = generate_with_smart_fallback(
+                                file_part=file_part,
+                                prompt_text="Extract raw GK questions matching system rules.",
+                                sys_instruction=stage1_system_prompt,
+                                live_status_box=live_box
+                            )
+                            clean_str = clean_json_response(resp)
+                            if clean_str:
+                                parsed = json.loads(clean_str)
+                                if isinstance(parsed, list):
+                                    scanned_raw.extend(parsed)
+                            progress_bar.progress((c_idx + 1) / len(page_slices))
                 else:
-                    text_content = uploaded_file.read().decode("utf-8")
-                    file_part = types.Part.from_bytes(data=text_content.encode("utf-8"), mime_type="text/plain")
-                    raw_resp, used_key_name = generate_with_smart_fallback(
+                    txt = uploaded_file.read().decode("utf-8")
+                    file_part = types.Part.from_bytes(data=txt.encode("utf-8"), mime_type="text/plain")
+                    resp, _ = generate_with_smart_fallback(
                         file_part=file_part,
-                        prompt_text="Extract all GK questions following verbatim and translation rules.",
-                        live_status_box=live_status_box
+                        prompt_text="Extract raw GK questions matching system rules.",
+                        sys_instruction=stage1_system_prompt,
+                        live_status_box=live_box
                     )
-                    clean_json_str = clean_json_response(raw_resp)
-                    raw_extracted_questions = json.loads(clean_json_str)
+                    clean_str = clean_json_response(resp)
+                    scanned_raw = json.loads(clean_str)
                     progress_bar.progress(1.0)
             else:
-                st.warning("⚠️ దయచేసి ఒక PDF/TXT ఫైల్‌ను అప్‌లోడ్ చేయండి లేదా బాక్స్‌లో టెక్స్ట్‌ను పేస్ట్ చేయండి.")
+                st.warning("⚠️ దయచేసి ఒక PDF/TXT ఫైల్‌ను అప్‌లోడ్ చేయండి లేదా టెక్స్ట్‌ను పేస్ట్ చేయండి.")
 
-            if raw_extracted_questions:
-                final_unique_questions = deduplicate_and_merge_questions(raw_extracted_questions)
-                st.session_state["extracted_questions"] = final_unique_questions
-                status_text.empty()
-                live_status_box.empty()
-                st.success(f"🎉 100% Extraction Successful! Total Unique GK Questions Extracted: {len(final_unique_questions)}")
+            # Stage 1 Industrial Deduplication & ID Re-indexing
+            unique_scanned = deduplicate_raw_scanned_list(scanned_raw)
+            for i, item in enumerate(unique_scanned):
+                item["id"] = i + 1
+
+            st.session_state["raw_scanned_questions"] = unique_scanned
+            status_box.empty()
+            live_box.empty()
+            st.rerun()
+
+        except Exception as err:
+            st.error(f"Stage 1 Scanning Error: {err}")
+
+# Display Stage 1 Results & Confirmation Gatekeeper
+if st.session_state["raw_scanned_questions"]:
+    raw_list = st.session_state["raw_scanned_questions"]
+    st.success(f"🎯 **GK Questions Found: `{len(raw_list)}`** (Deduplicated & Verified. Review list below before proceeding)")
+    
+    with st.expander(f"📋 View Identified Raw Questions List ({len(raw_list)} items)", expanded=False):
+        for item in raw_list:
+            q_txt = item.get("raw_question", "")
+            opts = item.get("raw_options", {})
+            st.markdown(f"**Q{item.get('id')}:** {q_txt}")
+            st.caption(f"Options: {opts} | Detected Ans: `{item.get('detected_answer')}`")
+            st.divider()
+
+    with col_step2:
+        btn_enrich = st.button(f"⚡ 2. Confirm & Generate Multilingual ({len(raw_list)} Questions)", type="primary", use_container_width=True)
+
+    # 9. STAGE 2: Deterministic Python Slicing & Micro-Batch Enrichment
+    if btn_enrich:
+        status_box2 = st.empty()
+        live_box2 = st.empty()
+        prog2 = st.progress(0)
+        
+        enriched_results = []
+        batch_size = 3  # Safe micro-batch: 3 questions per call to protect token limit & 503 errors
+        total_items = len(raw_list)
+        
+        batches = [raw_list[i:i+batch_size] for i in range(0, total_items, batch_size)]
+        total_batches = len(batches)
+        
+        try:
+            for b_idx, current_batch in enumerate(batches):
+                start_q = b_idx * batch_size + 1
+                end_q = min((b_idx + 1) * batch_size, total_items)
+                status_box2.markdown(f"⏳ **Enriching Questions {start_q} to {end_q} of {total_items}** (Batch {b_idx + 1}/{total_batches})...")
+                
+                batch_payload = json.dumps(current_batch, ensure_ascii=False)
+                file_part = types.Part.from_bytes(data=batch_payload.encode("utf-8"), mime_type="text/plain")
+                
+                resp, _ = generate_with_smart_fallback(
+                    file_part=file_part,
+                    prompt_text="Translate (En, Te, Hi), solve/verify, and enrich these questions in strict JSON format.",
+                    sys_instruction=stage2_system_prompt,
+                    live_status_box=live_box2
+                )
+                
+                clean_str = clean_json_response(resp)
+                if clean_str:
+                    batch_out = json.loads(clean_str)
+                    if isinstance(batch_out, list):
+                        enriched_results.extend(batch_out)
+                        
+                prog2.progress((b_idx + 1) / total_batches)
+                time.sleep(0.3)
+                
+            st.session_state["extracted_questions"] = enriched_results
+            status_box2.empty()
+            live_box2.empty()
+            st.success(f"🎉 100% Multilingual Generation Complete! All {len(enriched_results)} Questions Enriched.")
 
         except Exception as e:
-            st.error(f"Error during AI processing: {e}")
+            st.error(f"Stage 2 Enrichment Error: {e}")
 
-# 10. Multilingual Preview & Supabase Save
-if "extracted_questions" in st.session_state and st.session_state["extracted_questions"]:
+# 10. Multilingual Preview & Direct Supabase Batch Save
+if st.session_state["extracted_questions"]:
     questions_data = st.session_state["extracted_questions"]
-
     st.subheader(f"📊 Extracted Questions ({len(questions_data)} GK Questions Total)")
 
     tab_preview, tab_raw = st.tabs(["📋 Multilingual Preview (Tab View)", "📄 JSON Output"])
@@ -556,7 +591,7 @@ if "extracted_questions" in st.session_state and st.session_state["extracted_que
         if not supabase:
             st.error("Supabase client not initialized.")
         else:
-            with st.spinner("Saving all 3-language questions to Supabase..."):
+            with st.spinner("Saving all questions to Supabase..."):
                 rows_to_insert = []
                 for q in questions_data:
                     rows_to_insert.append({
