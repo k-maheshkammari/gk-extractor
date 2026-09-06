@@ -17,7 +17,7 @@ from google.genai import types
 from supabase import create_client, Client
 from pypdf import PdfReader
 
-# 1. Environment Loading (.env and Streamlit Cloud Secrets)
+# 1. Environment Loading
 load_dotenv(find_dotenv(), override=True)
 
 gemini_keys_raw = []
@@ -42,17 +42,16 @@ if SUPABASE_URL and SUPABASE_KEY:
 DAILY_LIMIT_PER_KEY = 20
 TRACKER_FILE = "quota_tracker.json"
 
-# Google AI Studio Reset Cycle: US/Pacific Timezone (PT Midnight ~ 12:30 PM IST)
+# Google AI Studio Reset Cycle: US/Pacific Timezone
 def get_google_quota_date():
     if ZoneInfo:
         try:
             return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
         except Exception:
             pass
-    # Fallback to UTC-7 if ZoneInfo is unavailable
     return datetime.now(timezone(timedelta(hours=-7))).strftime("%Y-%m-%d")
 
-# 2. Daily Persistence Engine (Preserves calls & tokens on Refresh/Restart/Mobile)
+# 2. Daily Persistence Engine
 def load_tracker():
     google_today = get_google_quota_date()
     default_data = {
@@ -90,7 +89,6 @@ def save_tracker():
     except Exception:
         pass
 
-# Initialize session state from persistence file
 saved_data = load_tracker()
 
 if "key_status" not in st.session_state:
@@ -115,11 +113,13 @@ if "parsed_input_questions" not in st.session_state:
 if "enriched_questions" not in st.session_state:
     st.session_state["enriched_questions"] = []
 
+if "visible_count" not in st.session_state:
+    st.session_state["visible_count"] = 10
+
 def get_key_display(idx):
     k = gemini_keys_raw[idx]
     return f"Key {idx + 1} (...{k[-6:]})"
 
-# Strict Waterfall Key Selection: Exhausts Key 1 completely before Key 2
 def get_current_waterfall_client():
     for idx in range(len(gemini_keys_raw)):
         status = st.session_state["key_status"][idx]
@@ -128,13 +128,12 @@ def get_current_waterfall_client():
             return genai.Client(api_key=selected_key), idx, get_key_display(idx)
     return None, None, None
 
-# 3. UI Layout & Sidebar Live Transparency Center (Original Structure)
-st.set_page_config(page_title="SSC GK 25-Batch Turbo Engine", layout="wide")
-st.title("⚡ SSC GK Waterfall Batch Engine (Live Monitor)")
+# 3. UI Layout
+st.set_page_config(page_title="SSC GK 25-Batch Engine", layout="wide")
+st.title("⚡ SSC GK Waterfall Batch Engine")
 
+# Sidebar Monitor
 st.sidebar.header("📊 Live API & Quota Monitor")
-
-# Determine Current Active Waterfall Key
 active_client, active_idx, active_name = get_current_waterfall_client()
 if active_name:
     calls_done = st.session_state["key_status"][active_idx]["calls_made"]
@@ -143,7 +142,6 @@ if active_name:
 else:
     st.sidebar.error("❌ All Keys Quota Exhausted!")
 
-# Token Monitoring Dashboard
 st.sidebar.subheader("🎯 Live Token Tracker")
 t_met = st.session_state["token_metrics"]
 col_t1, col_t2 = st.sidebar.columns(2)
@@ -154,7 +152,6 @@ with col_t2:
 
 st.sidebar.caption(f"Input: `{t_met['last_input_tokens']:,}` | Session Total: `{t_met['session_total_tokens']:,}`")
 
-# Key-by-Key Waterfall Status
 st.sidebar.divider()
 st.sidebar.subheader("🔑 All Keys Status")
 for i in range(len(gemini_keys_raw)):
@@ -168,7 +165,7 @@ for i in range(len(gemini_keys_raw)):
     else:
         st.sidebar.markdown(f"⚪ **{k_name}**: `STANDBY` ({c_used}/{DAILY_LIMIT_PER_KEY})")
 
-# 4. Deterministic Parser with Robust Deduplication
+# 4. Helper Functions
 def clean_json_response(raw_text):
     text = raw_text.strip()
     match = re.search(r'\[\s*\{.*\}\s*\]', text, re.DOTALL)
@@ -185,8 +182,6 @@ def parse_incoming_input(text: str) -> list:
         return []
 
     parsed_raw = []
-
-    # Format A: JSON Array
     if clean_text.startswith("[") and clean_text.endswith("]"):
         try:
             data = json.loads(clean_text)
@@ -195,7 +190,6 @@ def parse_incoming_input(text: str) -> list:
         except Exception:
             pass
 
-    # Format B: Plain Text Blocks
     if not parsed_raw:
         if re.search(r'\n\s*[-*_]{3,}\s*(?:\n|$)', clean_text):
             blocks = re.split(r'\n\s*[-*_]{3,}\s*(?:\n|$)', clean_text)
@@ -215,7 +209,6 @@ def parse_incoming_input(text: str) -> list:
                 "correct_answer": detected_ans
             })
 
-    # Strict Deduplication: Full content normalization (prevents collision between questions with similar prefixes)
     deduped = []
     seen_hashes = set()
     for item in parsed_raw:
@@ -225,13 +218,11 @@ def parse_incoming_input(text: str) -> list:
             seen_hashes.add(normalized_str)
             deduped.append(item)
 
-    # Re-index unique IDs deterministically 1..N
     for idx, item in enumerate(deduped):
         item["id"] = idx + 1
 
     return deduped
 
-# 5. Metadata Extractor
 def parse_metadata_from_name(name_str):
     name = (name_str or "").lower()
     exam = "SSC CGL" if "cgl" in name else ("SSC CHSL" if "chsl" in name else ("SSC MTS" if "mts" in name else "SSC"))
@@ -242,7 +233,6 @@ def parse_metadata_from_name(name_str):
     shift = shift_match.group(0).replace("-", " ").title() if shift_match else ""
     return exam, state, date, shift
 
-# 6. UNTOUCHED System Prompt (Preserves 4-Level Meta-Tags, 3 Languages, 100% DB Structure)
 batch25_system_prompt = """
 You are an expert Indian Competitive Exam Solution Engineer (NCERT & Telugu Academy standard).
 
@@ -276,7 +266,6 @@ OUTPUT FORMAT:
 ]
 """
 
-# 7. Waterfall API Processing Engine with Auto-Split & Quota Persistence
 def process_full_batch(questions_list, live_box, max_retries=10):
     payload = json.dumps(questions_list, ensure_ascii=False)
     file_part = types.Part.from_bytes(data=payload.encode("utf-8"), mime_type="text/plain")
@@ -301,12 +290,10 @@ def process_full_batch(questions_list, live_box, max_retries=10):
             )
             duration = round(time.time() - start_t, 2)
             
-            # 1. Update Calls Counter
             st.session_state["key_status"][key_idx]["calls_made"] += 1
             if st.session_state["key_status"][key_idx]["calls_made"] >= DAILY_LIMIT_PER_KEY:
                 st.session_state["key_status"][key_idx]["exhausted"] = True
 
-            # 2. Extract Token Telemetry
             usage = response.usage_metadata
             inp_tok = getattr(usage, "prompt_token_count", 0)
             out_tok = getattr(usage, "candidates_token_count", 0)
@@ -317,13 +304,12 @@ def process_full_batch(questions_list, live_box, max_retries=10):
             st.session_state["token_metrics"]["last_total_tokens"] = tot_tok
             st.session_state["token_metrics"]["session_total_tokens"] += tot_tok
 
-            # 3. Check for MAX_TOKENS Truncation
             finish_reason = ""
             if response.candidates and len(response.candidates) > 0:
                 finish_reason = str(response.candidates[0].finish_reason)
 
             if "MAX_TOKENS" in finish_reason:
-                st.warning(f"⚠️ {key_name} వద్ద టోకెన్లు సరిపోలేదు (MAX_TOKENS). బ్యాచ్‌ను ఆటోమేటిక్‌గా రెండు భాగాలుగా విడదీస్తున్నాం...")
+                st.warning(f"⚠️ {key_name} వద్ద టోకెన్లు సరిపోలేదు. విభజిస్తున్నాం...")
                 mid = len(questions_list) // 2
                 batch_a = process_full_batch(questions_list[:mid], live_box, max_retries)
                 batch_b = process_full_batch(questions_list[mid:], live_box, max_retries)
@@ -338,7 +324,6 @@ def process_full_batch(questions_list, live_box, max_retries=10):
                 save_tracker()
                 return merged
 
-            # 4. Clean and Parse JSON
             clean_str = clean_json_response(response.text)
             if clean_str:
                 result = json.loads(clean_str)
@@ -351,7 +336,6 @@ def process_full_batch(questions_list, live_box, max_retries=10):
                         "duration": f"{duration}s",
                         "status": "SUCCESS"
                     })
-                    # Save permanently for Refresh/Restart
                     save_tracker()
                     return result
 
@@ -361,20 +345,18 @@ def process_full_batch(questions_list, live_box, max_retries=10):
                 st.session_state["key_status"][key_idx]["exhausted"] = True
                 st.session_state["key_status"][key_idx]["calls_made"] = DAILY_LIMIT_PER_KEY
                 save_tracker()
-                st.warning(f"⚠️ `{key_name}` 20-కాల్ లిమిట్ తాకింది! వాటర్‌ఫాల్ ప్రకారం తర్వాతి కీకి బదిలీ చేస్తున్నాం...")
+                st.warning(f"⚠️ `{key_name}` లిమిట్ తాకింది! వాటర్‌ఫాల్ కీ మారుతోంది...")
                 time.sleep(1)
             elif "503" in err_msg or "UNAVAILABLE" in err_msg:
                 wait_t = min(3 * (attempt + 1), 10)
-                st.warning(f"⏳ సర్వర్ బిజీ (503). {wait_t} సెకన్లు ఆగి మళ్లీ ప్రయత్నిస్తున్నాం...")
                 time.sleep(wait_t)
             else:
-                st.warning(f"⚠️ ఎర్రర్: {err_msg[:90]}... రీట్రై అవుతోంది...")
                 time.sleep(2)
 
-    raise Exception("25 ప్రశ్నల ప్రాసెసింగ్ పూర్తి కాలేదు. దయచేసి API కీల కోటాను తనిఖీ చేయండి.")
+    raise Exception("25 ప్రశ్నల ప్రాసెసింగ్ పూర్తి కాలేదు.")
 
-# 8. User Input Tabs
-tab_text, tab_file = st.tabs(["📋 Direct Paste GK Questions", "📄 Upload File (TXT/PDF)"])
+# 5. UI TABS (Direct Paste, Upload, Search Portal)
+tab_text, tab_file, tab_search = st.tabs(["📋 Direct Paste GK Questions", "📄 Upload File (TXT/PDF)", "🔍 Search Database"])
 detected_meta = {"exam": "SSC CGL", "state": "Central", "date": "", "shift": ""}
 
 with tab_text:
@@ -390,6 +372,70 @@ with tab_file:
         e, s, d, sh = parse_metadata_from_name(uploaded_file.name)
         detected_meta = {"exam": e, "state": s, "date": d, "shift": sh}
 
+# --- TAB 3: SMART SEARCH PORTAL ---
+with tab_search:
+    st.subheader("🎯 Explore & Practice GK Database")
+    s_col1, s_col2 = st.columns([3, 1])
+    with s_col1:
+        search_kw = st.text_input("Search Questions (e.g. Chabahar, Bonalu, Article 249, Sati, UCC)", placeholder="Type a keyword and press Enter...")
+    with s_col2:
+        exam_filt = st.selectbox("Exam Filter", ["All Exams", "SSC CGL", "SSC CHSL", "SSC MTS", "Central"])
+
+    if st.button("🔎 Search Questions", use_container_width=True) or search_kw:
+        if not supabase:
+            st.error("Supabase client not connected.")
+        else:
+            with st.spinner("Searching database..."):
+                try:
+                    kw = search_kw.strip().lower()
+                    query = supabase.table("gk_questions").select("*")
+                    if exam_filt != "All Exams":
+                        query = query.ilike("exam_name", f"%{exam_filt}%")
+                    
+                    if kw:
+                        query = query.or_(f"question->>en.ilike.%{kw}%,question->>te.ilike.%{kw}%,question->>hi.ilike.%{kw}%")
+
+                    res = query.order("created_at", desc=True).limit(st.session_state["visible_count"]).execute()
+                    questions = res.data or []
+
+                    if not questions:
+                        st.info("💡 ఎలాంటి ప్రశ్నలు కనుగొనబడలేదు.")
+                    else:
+                        st.success(f"✨ Found {len(questions)} Questions matching your search:")
+                        for idx, q in enumerate(questions):
+                            q_data = q.get("question", {}) or {}
+                            opts_data = q.get("options", {}) or {}
+                            expl_data = q.get("explanation", {}) or {}
+                            
+                            with st.container():
+                                st.markdown(f"**Q{idx+1}. {q_data.get('en', '')}**")
+                                st.caption(f"📍 {q.get('state','Central')} | 🏛️ {q.get('exam_name','SSC')} | 📅 {q.get('date','')} {q.get('shift','')}")
+                                
+                                l_tab1, l_tab2, l_tab3 = st.tabs(["🇬🇧 English", "🇮🇳 తెలుగు", "🇮🇳 हिंदी"])
+                                with l_tab1:
+                                    en_opts = opts_data.get("en", {})
+                                    for k in sorted(en_opts.keys()):
+                                        st.write(f"**({k})** {en_opts[k]}")
+                                with l_tab2:
+                                    st.markdown(f"**ప్రశ్న:** {q_data.get('te', '')}")
+                                    te_opts = opts_data.get("te", {})
+                                    for k in sorted(te_opts.keys()):
+                                        st.write(f"**({k})** {te_opts[k]}")
+                                with l_tab3:
+                                    st.markdown(f"**प्रश्न:** {q_data.get('hi', '')}")
+                                    hi_opts = opts_data.get("hi", {})
+                                    for k in sorted(hi_opts.keys()):
+                                        st.write(f"**({k})** {hi_opts[k]}")
+
+                                with st.expander("💡 View Answer & Detailed Explanation"):
+                                    st.success(f"✅ Correct Answer: Option ({q.get('correct_answer')})")
+                                    st.markdown(f"**English:** {expl_data.get('en', '')}")
+                                    st.markdown(f"**తెలుగు:** {expl_data.get('te', '')}")
+                                    st.markdown(f"**हिंदी:** {expl_data.get('hi', '')}")
+                                st.divider()
+                except Exception as err:
+                    st.error(f"Search Error: {err}")
+
 # Sidebar Metadata
 st.sidebar.divider()
 st.sidebar.subheader("📝 Paper Details")
@@ -398,9 +444,8 @@ manual_state = st.sidebar.text_input("State", value=detected_meta["state"])
 manual_date = st.sidebar.text_input("Date", value=detected_meta["date"])
 manual_shift = st.sidebar.text_input("Shift", value=detected_meta["shift"])
 
-# 9. Gatekeeper: Parse and Lock Unique Questions
+# 6. Gatekeeper
 col1, col2 = st.columns([1, 1])
-
 with col1:
     btn_parse = st.button("🔍 1. Verify & Lock Clean Questions", type="primary", use_container_width=True)
 
@@ -424,7 +469,7 @@ if btn_parse:
         st.session_state["enriched_questions"] = []
         st.rerun()
 
-# 10. Enrichment Trigger & Preview
+# 7. Enrichment Trigger
 if st.session_state["parsed_input_questions"]:
     parsed_list = st.session_state["parsed_input_questions"]
     total_q = len(parsed_list)
@@ -437,14 +482,11 @@ if st.session_state["parsed_input_questions"]:
     if btn_start_enrich:
         status_box = st.empty()
         live_box = st.empty()
-
         status_box.markdown(f"⏳ **Processing All {total_q} Questions via Waterfall Engine...**")
         start_time = time.time()
 
         try:
             enriched_results = process_full_batch(parsed_list, live_box)
-
-            # Map into Final Database Object (100% Intact Schema)
             final_data = []
             seen_final_ids = set()
             for idx, item in enumerate(enriched_results):
@@ -467,13 +509,12 @@ if st.session_state["parsed_input_questions"]:
             live_box.empty()
             st.success(f"🎉 Complete! All {len(final_data)} Questions Enriched in {elapsed}s.")
             st.rerun()
-
         except Exception as e:
             status_box.empty()
             live_box.empty()
             st.error(f"Processing Error: {e}")
 
-# 11. Multilingual Review & Supabase Direct Ingestion (100% Immutable Format)
+# 8. Multilingual Review & Supabase Direct Ingestion
 if st.session_state["enriched_questions"]:
     data = st.session_state["enriched_questions"]
     st.subheader(f"📊 Ready for Database ({len(data)} GK Questions)")
@@ -507,8 +548,6 @@ if st.session_state["enriched_questions"]:
     with tab_audit:
         if st.session_state["audit_logs"]:
             st.dataframe(pd.DataFrame(st.session_state["audit_logs"]), use_container_width=True)
-        else:
-            st.caption("No batch executions logged yet.")
 
     st.divider()
     if st.button("💾 Push All Questions to Supabase Database", type="primary", use_container_width=True):
@@ -530,19 +569,15 @@ if st.session_state["enriched_questions"]:
                         "explanation": q.get("explanation")
                     })
 
-                # Safe Batch Insert (with automatic retries)
-                success = False
                 for attempt in range(1, 4):
                     try:
                         for i in range(0, len(rows), 25):
                             batch = rows[i:i + 25]
                             supabase.table("gk_questions").insert(batch).execute()
                         st.success(f"🎉 Success! All {len(rows)} Unique Questions pushed to Supabase.")
-                        success = True
                         break
                     except Exception as err:
                         if attempt < 3:
-                            st.warning(f"⚠️ డేటాబేస్ రీట్రై ({attempt}/3)... 2 సెకన్లు వేచిచూస్తున్నాం.")
                             time.sleep(2)
                         else:
                             st.error(f"Database error: {err}")
