@@ -17,7 +17,7 @@ from google.genai import types
 from supabase import create_client, Client
 from pypdf import PdfReader
 
-# 1. Environment Loading
+# 1. Environment Loading (.env and Streamlit Cloud Secrets)
 load_dotenv(find_dotenv(), override=True)
 
 gemini_keys_raw = []
@@ -42,7 +42,7 @@ if SUPABASE_URL and SUPABASE_KEY:
 DAILY_LIMIT_PER_KEY = 20
 TRACKER_FILE = "quota_tracker.json"
 
-# Google AI Studio Reset Cycle: US/Pacific Timezone
+# Google AI Studio Reset Cycle: US/Pacific Timezone (PT Midnight ~ 12:30 PM IST)
 def get_google_quota_date():
     if ZoneInfo:
         try:
@@ -51,7 +51,7 @@ def get_google_quota_date():
             pass
     return datetime.now(timezone(timedelta(hours=-7))).strftime("%Y-%m-%d")
 
-# 2. Daily Persistence Engine
+# 2. Daily Persistence Engine (Preserves calls & tokens on Refresh/Restart/Mobile)
 def load_tracker():
     google_today = get_google_quota_date()
     default_data = {
@@ -89,6 +89,7 @@ def save_tracker():
     except Exception:
         pass
 
+# Initialize session state from persistence file
 saved_data = load_tracker()
 
 if "key_status" not in st.session_state:
@@ -120,6 +121,7 @@ def get_key_display(idx):
     k = gemini_keys_raw[idx]
     return f"Key {idx + 1} (...{k[-6:]})"
 
+# Strict Waterfall Key Selection: Exhausts Key 1 completely before Key 2
 def get_current_waterfall_client():
     for idx in range(len(gemini_keys_raw)):
         status = st.session_state["key_status"][idx]
@@ -128,12 +130,13 @@ def get_current_waterfall_client():
             return genai.Client(api_key=selected_key), idx, get_key_display(idx)
     return None, None, None
 
-# 3. UI Layout
-st.set_page_config(page_title="SSC GK 25-Batch Engine", layout="wide")
-st.title("⚡ SSC GK Waterfall Batch Engine")
+# 3. UI Layout & Sidebar Live Transparency Center
+st.set_page_config(page_title="SSC GK 25-Batch Turbo Engine", layout="wide")
+st.title("⚡ SSC GK Waterfall Batch Engine (Live Monitor)")
 
-# Sidebar Monitor
 st.sidebar.header("📊 Live API & Quota Monitor")
+
+# Determine Current Active Waterfall Key
 active_client, active_idx, active_name = get_current_waterfall_client()
 if active_name:
     calls_done = st.session_state["key_status"][active_idx]["calls_made"]
@@ -142,6 +145,7 @@ if active_name:
 else:
     st.sidebar.error("❌ All Keys Quota Exhausted!")
 
+# Token Monitoring Dashboard
 st.sidebar.subheader("🎯 Live Token Tracker")
 t_met = st.session_state["token_metrics"]
 col_t1, col_t2 = st.sidebar.columns(2)
@@ -152,6 +156,7 @@ with col_t2:
 
 st.sidebar.caption(f"Input: `{t_met['last_input_tokens']:,}` | Session Total: `{t_met['session_total_tokens']:,}`")
 
+# Key-by-Key Waterfall Status
 st.sidebar.divider()
 st.sidebar.subheader("🔑 All Keys Status")
 for i in range(len(gemini_keys_raw)):
@@ -165,7 +170,7 @@ for i in range(len(gemini_keys_raw)):
     else:
         st.sidebar.markdown(f"⚪ **{k_name}**: `STANDBY` ({c_used}/{DAILY_LIMIT_PER_KEY})")
 
-# 4. Helper Functions
+# 4. Deterministic Parser with Robust Deduplication
 def clean_json_response(raw_text):
     text = raw_text.strip()
     match = re.search(r'\[\s*\{.*\}\s*\]', text, re.DOTALL)
@@ -233,6 +238,7 @@ def parse_metadata_from_name(name_str):
     shift = shift_match.group(0).replace("-", " ").title() if shift_match else ""
     return exam, state, date, shift
 
+# 5. Multilingual NCERT & Telugu Academy System Prompt
 batch25_system_prompt = """
 You are an expert Indian Competitive Exam Solution Engineer (NCERT & Telugu Academy standard).
 
@@ -266,9 +272,13 @@ OUTPUT FORMAT:
 ]
 """
 
-def process_full_batch(questions_list, live_box, max_retries=10):
+# 6. Waterfall API Processing Engine with Smart Cooldown & Quota Persistence
+def process_full_batch(questions_list, live_box, max_retries=15):
     payload = json.dumps(questions_list, ensure_ascii=False)
     file_part = types.Part.from_bytes(data=payload.encode("utf-8"), mime_type="text/plain")
+    
+    # Track rate-limit hits per key to differentiate temporary minute spikes from daily limits
+    key_429_retries = {}
 
     for attempt in range(max_retries):
         client, key_idx, key_name = get_current_waterfall_client()
@@ -290,10 +300,12 @@ def process_full_batch(questions_list, live_box, max_retries=10):
             )
             duration = round(time.time() - start_t, 2)
             
+            # 1. Update Calls Counter
             st.session_state["key_status"][key_idx]["calls_made"] += 1
             if st.session_state["key_status"][key_idx]["calls_made"] >= DAILY_LIMIT_PER_KEY:
                 st.session_state["key_status"][key_idx]["exhausted"] = True
 
+            # 2. Extract Token Telemetry
             usage = response.usage_metadata
             inp_tok = getattr(usage, "prompt_token_count", 0)
             out_tok = getattr(usage, "candidates_token_count", 0)
@@ -304,12 +316,13 @@ def process_full_batch(questions_list, live_box, max_retries=10):
             st.session_state["token_metrics"]["last_total_tokens"] = tot_tok
             st.session_state["token_metrics"]["session_total_tokens"] += tot_tok
 
+            # 3. Check for MAX_TOKENS Truncation
             finish_reason = ""
             if response.candidates and len(response.candidates) > 0:
                 finish_reason = str(response.candidates[0].finish_reason)
 
             if "MAX_TOKENS" in finish_reason:
-                st.warning(f"⚠️ {key_name} వద్ద టోకెన్లు సరిపోలేదు. విభజిస్తున్నాం...")
+                st.warning(f"⚠️ {key_name} వద్ద టోకెన్లు సరిపోలేదు (MAX_TOKENS). బ్యాచ్‌ను ఆటోమేటిక్‌గా రెండు భాగాలుగా విడదీస్తున్నాం...")
                 mid = len(questions_list) // 2
                 batch_a = process_full_batch(questions_list[:mid], live_box, max_retries)
                 batch_b = process_full_batch(questions_list[mid:], live_box, max_retries)
@@ -324,6 +337,7 @@ def process_full_batch(questions_list, live_box, max_retries=10):
                 save_tracker()
                 return merged
 
+            # 4. Clean and Parse JSON
             clean_str = clean_json_response(response.text)
             if clean_str:
                 result = json.loads(clean_str)
@@ -342,20 +356,32 @@ def process_full_batch(questions_list, live_box, max_retries=10):
         except Exception as err:
             err_msg = str(err)
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                st.session_state["key_status"][key_idx]["exhausted"] = True
-                st.session_state["key_status"][key_idx]["calls_made"] = DAILY_LIMIT_PER_KEY
-                save_tracker()
-                st.warning(f"⚠️ `{key_name}` లిమిట్ తాకింది! వాటర్‌ఫాల్ కీ మారుతోంది...")
-                time.sleep(1)
+                current_hits = key_429_retries.get(key_idx, 0) + 1
+                key_429_retries[key_idx] = current_hits
+                
+                # If hit once, it's a temporary minute-level traffic spike (TPM). Wait 6 seconds and retry with same key.
+                if current_hits < 2:
+                    st.warning(f"⏳ `{key_name}` వద్ద తాత్కాలిక నిమిషాల రద్దీ (TPM Limit). 6 సెకన్లు ఆగి మళ్లీ ప్రయత్నిస్తున్నాం...")
+                    time.sleep(6)
+                    continue
+                else:
+                    # Consecutive failure: Confirm actual daily quota limit and waterfall to next key
+                    st.session_state["key_status"][key_idx]["exhausted"] = True
+                    st.session_state["key_status"][key_idx]["calls_made"] = DAILY_LIMIT_PER_KEY
+                    save_tracker()
+                    st.warning(f"⚠️ `{key_name}` డైలీ కోటా తాకింది! వాటర్‌ఫాల్ ప్రకారం తర్వాతి కీకి బదిలీ చేస్తున్నాం...")
+                    time.sleep(1)
             elif "503" in err_msg or "UNAVAILABLE" in err_msg:
                 wait_t = min(3 * (attempt + 1), 10)
+                st.warning(f"⏳ సర్వర్ బిజీ (503). {wait_t} సెకన్లు వేచిచూస్తున్నాం...")
                 time.sleep(wait_t)
             else:
+                st.warning(f"⚠️ ఎర్రర్: {err_msg[:90]}... రీట్రై అవుతోంది...")
                 time.sleep(2)
 
-    raise Exception("25 ప్రశ్నల ప్రాసెసింగ్ పూర్తి కాలేదు.")
+    raise Exception("25 ప్రశ్నల ప్రాసెసింగ్ పూర్తి కాలేదు. దయచేసి API కీల కోటాను తనిఖీ చేయండి.")
 
-# 5. UI TABS (Direct Paste, Upload, Search Portal)
+# 7. UI TABS: Direct Paste, Upload File, and Mobile Search Portal
 tab_text, tab_file, tab_search = st.tabs(["📋 Direct Paste GK Questions", "📄 Upload File (TXT/PDF)", "🔍 Search Database"])
 detected_meta = {"exam": "SSC CGL", "state": "Central", "date": "", "shift": ""}
 
@@ -444,7 +470,7 @@ manual_state = st.sidebar.text_input("State", value=detected_meta["state"])
 manual_date = st.sidebar.text_input("Date", value=detected_meta["date"])
 manual_shift = st.sidebar.text_input("Shift", value=detected_meta["shift"])
 
-# 6. Gatekeeper
+# 8. Gatekeeper: Parse and Lock Unique Questions
 col1, col2 = st.columns([1, 1])
 with col1:
     btn_parse = st.button("🔍 1. Verify & Lock Clean Questions", type="primary", use_container_width=True)
@@ -469,7 +495,7 @@ if btn_parse:
         st.session_state["enriched_questions"] = []
         st.rerun()
 
-# 7. Enrichment Trigger
+# 9. Enrichment Trigger & Preview
 if st.session_state["parsed_input_questions"]:
     parsed_list = st.session_state["parsed_input_questions"]
     total_q = len(parsed_list)
@@ -514,7 +540,7 @@ if st.session_state["parsed_input_questions"]:
             live_box.empty()
             st.error(f"Processing Error: {e}")
 
-# 8. Multilingual Review & Supabase Direct Ingestion
+# 10. Multilingual Review & Supabase Direct Ingestion
 if st.session_state["enriched_questions"]:
     data = st.session_state["enriched_questions"]
     st.subheader(f"📊 Ready for Database ({len(data)} GK Questions)")
