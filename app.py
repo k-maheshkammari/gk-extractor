@@ -602,7 +602,7 @@ if st.session_state["enriched_questions"]:
                             supabase.table("gk_questions").insert(batch).execute()
                         st.success(f"🎉 Success! All {len(rows)} Unique Questions pushed to Supabase.")
                         break
-                    except Exception as err:
+                    except Exception as err: 
                         if attempt < 3:
                             time.sleep(2)
                         else:
