@@ -3,18 +3,23 @@ import re
 import json
 import io
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 import streamlit as st
 import pandas as pd
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
 from pypdf import PdfReader
 
-load_dotenv()
+# 1. Environment Loading (.env and Streamlit Cloud Secrets)
+load_dotenv(find_dotenv(), override=True)
 
-# 1. API Keys Initialization (1 to 15 Keys Support)
 gemini_keys_raw = []
 for i in range(1, 16):
     val = os.getenv(f"GEMINI_API_KEY_{i}")
@@ -35,15 +40,74 @@ if SUPABASE_URL and SUPABASE_KEY:
         st.error(f"Supabase Connection Error: {e}")
 
 DAILY_LIMIT_PER_KEY = 20
+TRACKER_FILE = "quota_tracker.json"
+
+# Google AI Studio Reset Cycle: US/Pacific Timezone (PT Midnight ~ 12:30 PM IST)
+def get_google_quota_date():
+    if ZoneInfo:
+        try:
+            return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # Fallback to UTC-7 if ZoneInfo is unavailable
+    return datetime.now(timezone(timedelta(hours=-7))).strftime("%Y-%m-%d")
+
+# 2. Daily Persistence Engine (Preserves calls & tokens on Refresh/Restart/Mobile)
+def load_tracker():
+    google_today = get_google_quota_date()
+    default_data = {
+        "date": google_today,
+        "calls_made": {str(i): 0 for i in range(len(gemini_keys_raw))},
+        "token_metrics": {
+            "last_input_tokens": 0,
+            "last_output_tokens": 0,
+            "last_total_tokens": 0,
+            "session_total_tokens": 0
+        },
+        "audit_logs": []
+    }
+    if os.path.exists(TRACKER_FILE):
+        try:
+            with open(TRACKER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("date") == google_today:
+                    return data
+        except Exception:
+            pass
+    return default_data
+
+def save_tracker():
+    google_today = get_google_quota_date()
+    data_to_save = {
+        "date": google_today,
+        "calls_made": {str(i): st.session_state["key_status"][i]["calls_made"] for i in range(len(gemini_keys_raw))},
+        "token_metrics": st.session_state["token_metrics"],
+        "audit_logs": st.session_state["audit_logs"][-50:]
+    }
+    try:
+        with open(TRACKER_FILE, "w", encoding="utf-8") as f:
+            json.dump(data_to_save, f, indent=2)
+    except Exception:
+        pass
+
+# Initialize session state from persistence file
+saved_data = load_tracker()
 
 if "key_status" not in st.session_state:
     st.session_state["key_status"] = {
-        i: {"exhausted": False, "calls_made": 0, "last_tested": None} 
+        i: {
+            "exhausted": saved_data["calls_made"].get(str(i), 0) >= DAILY_LIMIT_PER_KEY,
+            "calls_made": saved_data["calls_made"].get(str(i), 0),
+            "last_error": None
+        }
         for i in range(len(gemini_keys_raw))
     }
 
-if "round_robin_idx" not in st.session_state:
-    st.session_state["round_robin_idx"] = 0
+if "token_metrics" not in st.session_state:
+    st.session_state["token_metrics"] = saved_data["token_metrics"]
+
+if "audit_logs" not in st.session_state:
+    st.session_state["audit_logs"] = saved_data["audit_logs"]
 
 if "parsed_input_questions" not in st.session_state:
     st.session_state["parsed_input_questions"] = []
@@ -55,87 +119,59 @@ def get_key_display(idx):
     k = gemini_keys_raw[idx]
     return f"Key {idx + 1} (...{k[-6:]})"
 
-def test_single_key(idx):
-    k = gemini_keys_raw[idx]
-    try:
-        client = genai.Client(api_key=k)
-        client.models.generate_content(model="gemini-3.6-flash", contents="OK")
-        st.session_state["key_status"][idx]["exhausted"] = False
-        return True
-    except Exception as err:
-        err_msg = str(err)
-        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            st.session_state["key_status"][idx]["exhausted"] = True
-            st.session_state["key_status"][idx]["calls_made"] = DAILY_LIMIT_PER_KEY
-        return False
+# Strict Waterfall Key Selection: Exhausts Key 1 completely before Key 2
+def get_current_waterfall_client():
+    for idx in range(len(gemini_keys_raw)):
+        status = st.session_state["key_status"][idx]
+        if not status["exhausted"] and status["calls_made"] < DAILY_LIMIT_PER_KEY:
+            selected_key = gemini_keys_raw[idx]
+            return genai.Client(api_key=selected_key), idx, get_key_display(idx)
+    return None, None, None
 
-def get_next_available_client():
-    active_indices = [
-        i for i in range(len(gemini_keys_raw)) 
-        if not st.session_state["key_status"][i]["exhausted"]
-    ]
-    if not active_indices:
-        return None, None, None
-    
-    current_idx = active_indices[st.session_state["round_robin_idx"] % len(active_indices)]
-    st.session_state["round_robin_idx"] += 1
-    selected_key = gemini_keys_raw[current_idx]
-    
-    return genai.Client(api_key=selected_key), current_idx, get_key_display(current_idx)
+# 3. UI Layout & Sidebar Live Transparency Center (Original Structure)
+st.set_page_config(page_title="SSC GK 25-Batch Turbo Engine", layout="wide")
+st.title("⚡ SSC GK Waterfall Batch Engine (Live Monitor)")
 
-# 2. UI Layout & Sidebar Monitor
-st.set_page_config(page_title="SSC GK Production Engine", layout="wide")
-st.title("⚡ SSC GK High-Speed Enrichment & Database Ingestion Engine")
+st.sidebar.header("📊 Live API & Quota Monitor")
 
-st.sidebar.header("📊 Live API Quota Monitor")
-active_keys_count = sum(1 for v in st.session_state["key_status"].values() if not v["exhausted"])
-total_keys_count = len(gemini_keys_raw)
+# Determine Current Active Waterfall Key
+active_client, active_idx, active_name = get_current_waterfall_client()
+if active_name:
+    calls_done = st.session_state["key_status"][active_idx]["calls_made"]
+    st.sidebar.success(f"👉 **Running Key:** `{active_name}`")
+    st.sidebar.progress(calls_done / DAILY_LIMIT_PER_KEY, text=f"Key Progress: {calls_done}/{DAILY_LIMIT_PER_KEY} Calls")
+else:
+    st.sidebar.error("❌ All Keys Quota Exhausted!")
 
-if st.sidebar.button("🔄 Check & Refresh All Keys", use_container_width=True):
-    with st.sidebar.status("Testing all keys..."):
-        for i in range(total_keys_count):
-            test_single_key(i)
-    st.rerun()
+# Token Monitoring Dashboard
+st.sidebar.subheader("🎯 Live Token Tracker")
+t_met = st.session_state["token_metrics"]
+col_t1, col_t2 = st.sidebar.columns(2)
+with col_t1:
+    st.metric("Last Output Tokens", f"{t_met['last_output_tokens']:,}")
+with col_t2:
+    st.metric("Last Total Tokens", f"{t_met['last_total_tokens']:,}")
 
-st.sidebar.markdown(f"**🟢 Active Keys:** `{active_keys_count} / {total_keys_count}`")
+st.sidebar.caption(f"Input: `{t_met['last_input_tokens']:,}` | Session Total: `{t_met['session_total_tokens']:,}`")
 
-total_calls_left = 0
-for i in range(total_keys_count):
-    if not st.session_state["key_status"][i]["exhausted"]:
-        calls_used = st.session_state["key_status"][i]["calls_made"]
-        total_calls_left += max(0, DAILY_LIMIT_PER_KEY - calls_used)
-
-st.sidebar.info(f"⚡ **Estimated Calls Left:** ~`{total_calls_left}`")
-
-with st.sidebar.expander("🔑 Individual Key Status", expanded=False):
-    for i in range(total_keys_count):
-        status_info = st.session_state["key_status"][i]
-        key_name = get_key_display(i)
-        if status_info["exhausted"]:
-            st.markdown(f"❌ **{key_name}**: `QUOTA EXHAUSTED`")
-        else:
-            calls_left = DAILY_LIMIT_PER_KEY - status_info["calls_made"]
-            st.markdown(f"✅ **{key_name}**: `{max(0, calls_left)}/{DAILY_LIMIT_PER_KEY} left`")
-
+# Key-by-Key Waterfall Status
 st.sidebar.divider()
+st.sidebar.subheader("🔑 All Keys Status")
+for i in range(len(gemini_keys_raw)):
+    status_info = st.session_state["key_status"][i]
+    k_name = get_key_display(i)
+    c_used = status_info["calls_made"]
+    if status_info["exhausted"] or c_used >= DAILY_LIMIT_PER_KEY:
+        st.sidebar.markdown(f"❌ **{k_name}**: `EXHAUSTED` ({c_used}/{DAILY_LIMIT_PER_KEY})")
+    elif i == active_idx:
+        st.sidebar.markdown(f"🟢 **{k_name}**: `ACTIVE RUNNER` ({c_used}/{DAILY_LIMIT_PER_KEY})")
+    else:
+        st.sidebar.markdown(f"⚪ **{k_name}**: `STANDBY` ({c_used}/{DAILY_LIMIT_PER_KEY})")
 
-# 3. Metadata Extractor
-def parse_metadata_from_name(name_str):
-    name = (name_str or "").lower()
-    exam = "SSC CGL" if "cgl" in name else ("SSC CHSL" if "chsl" in name else ("SSC MTS" if "mts" in name else "SSC"))
-    state = "Central"
-    
-    date_match = re.search(r'(\d{4}[-_]\d{2}[-_]\d{2})|(\d{1,2}(?:st|nd|rd|th)?[-_][a-z]{3}[-_]\d{4})', name)
-    date = date_match.group(0).replace("_", "-") if date_match else ""
-
-    shift_match = re.search(r'shift[-_\s]?\d+', name)
-    shift = shift_match.group(0).replace("-", " ").title() if shift_match else ""
-
-    return exam, state, date, shift
-
+# 4. Deterministic Parser with Robust Deduplication
 def clean_json_response(raw_text):
     text = raw_text.strip()
-    match = re.search(r'\[\s*\{.*\}\s*\]|\{\s*".*"\s*:\s*.*\}', text, re.DOTALL)
+    match = re.search(r'\[\s*\{.*\}\s*\]', text, re.DOTALL)
     if match:
         return match.group(0)
     text = re.sub(r'^```json\s*', '', text)
@@ -143,168 +179,230 @@ def clean_json_response(raw_text):
     text = re.sub(r'\s*```$', '', text)
     return text.strip()
 
-# 4. Universal Fault-Tolerant Question Parser (Detects Q.No, ---, Q1, 1.)
-def process_parsed_blocks(valid_parts: list) -> list:
-    parsed = []
-    for idx, part in enumerate(valid_parts):
-        ans_match = re.search(r'(?:Correct\s*(?:Answer|Option)|Ans(?:wer)?)[\s\:\-\=]+[\(\[]?\s*([A-Da-d1-4])\s*[\)\]]?', part, re.IGNORECASE)
-        detected_ans = ans_match.group(1).upper() if ans_match else None
-        if detected_ans in ["1", "2", "3", "4"]:
-            detected_ans = {"1": "A", "2": "B", "3": "C", "4": "D"}[detected_ans]
-
-        parsed.append({
-            "id": idx + 1,
-            "raw_block": part,
-            "detected_answer": detected_ans
-        })
-    return parsed
-
-def parse_raw_text_to_questions(text: str) -> list:
+def parse_incoming_input(text: str) -> list:
     clean_text = text.strip()
     if not clean_text:
         return []
 
-    # Strategy 1: JSON Array
+    parsed_raw = []
+
+    # Format A: JSON Array
     if clean_text.startswith("[") and clean_text.endswith("]"):
         try:
             data = json.loads(clean_text)
-            if isinstance(data, list) and len(data) > 0:
-                return data
+            if isinstance(data, list):
+                parsed_raw = data
         except Exception:
             pass
 
-    # Strategy 2: Horizontal Separators (--- or ===)
-    if re.search(r'\n\s*[-*_]{3,}\s*(?:\n|$)', clean_text):
-        raw_blocks = re.split(r'\n\s*[-*_]{3,}\s*(?:\n|$)', clean_text)
-        valid_parts = [b.strip() for b in raw_blocks if b.strip() and len(b.strip()) > 15]
-        if len(valid_parts) > 1:
-            return process_parsed_blocks(valid_parts)
+    # Format B: Plain Text Blocks
+    if not parsed_raw:
+        if re.search(r'\n\s*[-*_]{3,}\s*(?:\n|$)', clean_text):
+            blocks = re.split(r'\n\s*[-*_]{3,}\s*(?:\n|$)', clean_text)
+        else:
+            split_pattern = r'(?=(?:\n|^)\s*(?:Q\.?\s*No[\.\:\s]*\d+|\bQ\.?\s*\d+[\.\:\)]|\bQuestion\s*(?:\d+|[\:\(])|\d{1,3}[\.\)]\s+[A-Z\u0900-\u097F\u0C00-\u0C7F]))'
+            blocks = re.split(split_pattern, clean_text, flags=re.IGNORECASE)
 
-    # Strategy 3: Universal Regex Splitting (Q.No: 50, Q.No. 26, Question (EN):, Q1., 1.)
-    split_pattern = r'(?=(?:\n|^)\s*(?:Q\.?\s*No[\.\:\s]*\d+|\bQ\.?\s*\d+[\.\:\)]|\bQuestion\s*(?:\d+|[\:\(])|\d{1,3}[\.\)]\s+[A-Z\u0900-\u097F\u0C00-\u0C7F]))'
-    parts = re.split(split_pattern, clean_text, flags=re.IGNORECASE)
-    valid_parts = [p.strip() for p in parts if p.strip() and len(p.strip()) > 15]
+        valid_blocks = [b.strip() for b in blocks if b.strip() and len(b.strip()) > 15]
+        for b in valid_blocks:
+            ans_match = re.search(r'(?:Correct\s*(?:Answer|Option)|Ans(?:wer)?)[\s\:\-\=]+[\(\[]?\s*([A-Da-d1-4])\s*[\)\]]?', b, re.IGNORECASE)
+            detected_ans = ans_match.group(1).upper() if ans_match else "A"
+            if detected_ans in ["1", "2", "3", "4"]:
+                detected_ans = {"1": "A", "2": "B", "3": "C", "4": "D"}[detected_ans]
 
-    # Strategy 4: Fallback Regex if still bundled
-    if len(valid_parts) <= 1:
-        fallback_pattern = r'(?=(?:\n|^)\s*(?:Q\.?\s*No|\bQ\d+|\bQuestion|\d{1,3}[\.\)]))'
-        parts = re.split(fallback_pattern, clean_text, flags=re.IGNORECASE)
-        valid_parts = [p.strip() for p in parts if p.strip() and len(p.strip()) > 15]
+            parsed_raw.append({
+                "raw_block": b,
+                "correct_answer": detected_ans
+            })
 
-    return process_parsed_blocks(valid_parts)
+    # Strict Deduplication: Full content normalization (prevents collision between questions with similar prefixes)
+    deduped = []
+    seen_hashes = set()
+    for item in parsed_raw:
+        sample_str = item.get("raw_block") or str(item.get("question", ""))
+        normalized_str = re.sub(r'\s+', ' ', sample_str.lower()).strip()
+        if normalized_str and normalized_str not in seen_hashes:
+            seen_hashes.add(normalized_str)
+            deduped.append(item)
 
-# 5. Targeted Single-Item Enrichment System Prompt
-enrichment_system_prompt = """
+    # Re-index unique IDs deterministically 1..N
+    for idx, item in enumerate(deduped):
+        item["id"] = idx + 1
+
+    return deduped
+
+# 5. Metadata Extractor
+def parse_metadata_from_name(name_str):
+    name = (name_str or "").lower()
+    exam = "SSC CGL" if "cgl" in name else ("SSC CHSL" if "chsl" in name else ("SSC MTS" if "mts" in name else "SSC"))
+    state = "Central"
+    date_match = re.search(r'(\d{4}[-_]\d{2}[-_]\d{2})|(\d{1,2}(?:st|nd|rd|th)?[-_][a-z]{3}[-_]\d{4})', name)
+    date = date_match.group(0).replace("_", "-") if date_match else ""
+    shift_match = re.search(r'shift[-_\s]?\d+', name)
+    shift = shift_match.group(0).replace("-", " ").title() if shift_match else ""
+    return exam, state, date, shift
+
+# 6. UNTOUCHED System Prompt (Preserves 4-Level Meta-Tags, 3 Languages, 100% DB Structure)
+batch25_system_prompt = """
 You are an expert Indian Competitive Exam Solution Engineer (NCERT & Telugu Academy standard).
 
 TASK:
-You are provided with a single clean GK question block.
-Generate the academic solution, verified answer, 3-language translations (En, Te, Hi), detailed explanation, and strict 4-level meta-tags.
+You are provided with a batch of up to 25 clean GK questions.
+For EVERY question, you must return:
+1. "id": Matching the exact ID provided.
+2. "meta_tags": Exactly 4 hierarchical levels:
+   [Level 1: "Broad Subject", Level 2: "Main Topic", Level 3: "Sub-Topic", Level 4: "Specific Concept/Entity"]
+3. "explanation": Comprehensive, standard academic explanation in English, Telugu, and Hindi.
+4. "question" & "options": If the input question was in raw text form, format them into 3 languages ("en", "te", "hi"). If already structured in 3 languages, mirror them verbatim.
+5. "correct_answer": Verify or confirm the correct option ("A", "B", "C", or "D").
 
-CRITICAL RULES:
-1. PRESERVE SCIENCE & MATH SYMBOLS 100% INTACT:
-   - NEVER modify physics dimensional formulas (e.g., [M^1 L^2 T^-2]), chemistry formulas (H2SO4, FeSO4), Greek symbols (Ω, μ, λ, α, β, Δ), or math powers/roots.
-2. 3 LANGUAGES MANDATORY (en, te, hi):
-   - If English, Telugu, or Hindi is already present in raw text, extract it verbatim.
-   - For missing languages, provide natural, academic translations.
-3. 4-LEVEL HIERARCHICAL META-TAGS:
-   - meta_tags MUST strictly be a 4-element array:
-     [Level 1: "Broad Subject", Level 2: "Main Topic", Level 3: "Sub-Topic", Level 4: "Specific Concept/Entity"]
-     Example: ["General Science", "Biology", "Genetics & Heredity", "Pleiotropy"]
-4. VERIFIED CORRECT ANSWER:
-   - Confirm or solve the correct option ("A", "B", "C", or "D").
-5. COMPREHENSIVE EXPLANATION:
-   - Provide standard academic explanations in English, Telugu, and Hindi.
+STRICT RULE:
+Return ONLY a valid JSON array of objects without markdown backticks.
 
-OUTPUT FORMAT: Strict single JSON object without markdown backticks:
-{
-  "id": 1,
-  "question": {"en": "...", "te": "...", "hi": "..."},
-  "options": {
-    "en": {"A": "...", "B": "...", "C": "...", "D": "..."},
-    "te": {"A": "...", "B": "...", "C": "...", "D": "..."},
-    "hi": {"A": "...", "B": "...", "C": "...", "D": "..."}
-  },
-  "correct_answer": "A",
-  "meta_tags": ["Subject", "Topic", "Sub-Topic", "Concept"],
-  "explanation": {"en": "...", "te": "...", "hi": "..."}
-}
+OUTPUT FORMAT:
+[
+  {
+    "id": 1,
+    "question": {"en": "...", "te": "...", "hi": "..."},
+    "options": {
+      "en": {"A": "...", "B": "...", "C": "...", "D": "..."},
+      "te": {"A": "...", "B": "...", "C": "...", "D": "..."},
+      "hi": {"A": "...", "B": "...", "C": "...", "D": "..."}
+    },
+    "correct_answer": "A",
+    "meta_tags": ["Broad Subject", "Main Topic", "Sub-Topic", "Specific Concept"],
+    "explanation": {"en": "...", "te": "...", "hi": "..."}
+  }
+]
 """
 
-# 6. Fault-Tolerant Single-Item AI Engine (Zero 503 Risk)
-def enrich_single_question_safely(q_item, live_box, max_retries=10):
-    prompt_payload = json.dumps(q_item, ensure_ascii=False)
-    file_part = types.Part.from_bytes(data=prompt_payload.encode("utf-8"), mime_type="text/plain")
+# 7. Waterfall API Processing Engine with Auto-Split & Quota Persistence
+def process_full_batch(questions_list, live_box, max_retries=10):
+    payload = json.dumps(questions_list, ensure_ascii=False)
+    file_part = types.Part.from_bytes(data=payload.encode("utf-8"), mime_type="text/plain")
 
     for attempt in range(max_retries):
-        client, key_idx, key_name = get_next_available_client()
+        client, key_idx, key_name = get_current_waterfall_client()
         if not client:
-            raise Exception("అన్ని API కీలలో డైలీ కోటా పూర్తయింది.")
+            raise Exception("అన్ని API కీలలో డైలీ కోటా (20 RPD) పూర్తయింది.")
 
-        live_box.markdown(f"🔑 **Using:** `{key_name}` | 🔄 **Q{q_item.get('id')} Attempt:** `{attempt + 1}`")
+        live_box.markdown(f"🔑 **Running:** `{key_name}` | 🔄 **Batch Size:** `{len(questions_list)} Qs` | Attempt `{attempt+1}`")
 
         try:
+            start_t = time.time()
             response = client.models.generate_content(
                 model="gemini-3.6-flash",
-                contents=[file_part, "Enrich this GK question with translations, verified answer, explanation, and 4-level meta-tags."],
+                contents=[file_part, f"Enrich all {len(questions_list)} questions with 4-level meta-tags, 3-language explanations, and strict JSON format."],
                 config=types.GenerateContentConfig(
-                    system_instruction=enrichment_system_prompt,
+                    system_instruction=batch25_system_prompt,
                     response_mime_type="application/json",
                     temperature=0.0
                 )
             )
+            duration = round(time.time() - start_t, 2)
+            
+            # 1. Update Calls Counter
             st.session_state["key_status"][key_idx]["calls_made"] += 1
+            if st.session_state["key_status"][key_idx]["calls_made"] >= DAILY_LIMIT_PER_KEY:
+                st.session_state["key_status"][key_idx]["exhausted"] = True
+
+            # 2. Extract Token Telemetry
+            usage = response.usage_metadata
+            inp_tok = getattr(usage, "prompt_token_count", 0)
+            out_tok = getattr(usage, "candidates_token_count", 0)
+            tot_tok = getattr(usage, "total_token_count", 0)
+
+            st.session_state["token_metrics"]["last_input_tokens"] = inp_tok
+            st.session_state["token_metrics"]["last_output_tokens"] = out_tok
+            st.session_state["token_metrics"]["last_total_tokens"] = tot_tok
+            st.session_state["token_metrics"]["session_total_tokens"] += tot_tok
+
+            # 3. Check for MAX_TOKENS Truncation
+            finish_reason = ""
+            if response.candidates and len(response.candidates) > 0:
+                finish_reason = str(response.candidates[0].finish_reason)
+
+            if "MAX_TOKENS" in finish_reason:
+                st.warning(f"⚠️ {key_name} వద్ద టోకెన్లు సరిపోలేదు (MAX_TOKENS). బ్యాచ్‌ను ఆటోమేటిక్‌గా రెండు భాగాలుగా విడదీస్తున్నాం...")
+                mid = len(questions_list) // 2
+                batch_a = process_full_batch(questions_list[:mid], live_box, max_retries)
+                batch_b = process_full_batch(questions_list[mid:], live_box, max_retries)
+                
+                merged = []
+                seen_ids = set()
+                for q in (batch_a + batch_b):
+                    qid = q.get("id")
+                    if qid not in seen_ids:
+                        seen_ids.add(qid)
+                        merged.append(q)
+                save_tracker()
+                return merged
+
+            # 4. Clean and Parse JSON
             clean_str = clean_json_response(response.text)
             if clean_str:
-                return json.loads(clean_str)
+                result = json.loads(clean_str)
+                if isinstance(result, list) and len(result) > 0:
+                    st.session_state["audit_logs"].append({
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "key": key_name,
+                        "questions": len(questions_list),
+                        "tokens": out_tok,
+                        "duration": f"{duration}s",
+                        "status": "SUCCESS"
+                    })
+                    # Save permanently for Refresh/Restart
+                    save_tracker()
+                    return result
+
         except Exception as err:
             err_msg = str(err)
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                 st.session_state["key_status"][key_idx]["exhausted"] = True
                 st.session_state["key_status"][key_idx]["calls_made"] = DAILY_LIMIT_PER_KEY
-                st.warning(f"⚠️ `{key_name}` కోటా తాకింది! తర్వాతి కీకి స్విచ్ అవుతున్నాం...")
+                save_tracker()
+                st.warning(f"⚠️ `{key_name}` 20-కాల్ లిమిట్ తాకింది! వాటర్‌ఫాల్ ప్రకారం తర్వాతి కీకి బదిలీ చేస్తున్నాం...")
                 time.sleep(1)
             elif "503" in err_msg or "UNAVAILABLE" in err_msg:
-                wait_t = min(2 * (attempt + 1), 8)
+                wait_t = min(3 * (attempt + 1), 10)
                 st.warning(f"⏳ సర్వర్ బిజీ (503). {wait_t} సెకన్లు ఆగి మళ్లీ ప్రయత్నిస్తున్నాం...")
                 time.sleep(wait_t)
             else:
-                time.sleep(1.5)
+                st.warning(f"⚠️ ఎర్రర్: {err_msg[:90]}... రీట్రై అవుతోంది...")
+                time.sleep(2)
 
-    raise Exception(f"Q{q_item.get('id')} ప్రాసెసింగ్ ఫెయిల్ అయింది.")
+    raise Exception("25 ప్రశ్నల ప్రాసెసింగ్ పూర్తి కాలేదు. దయచేసి API కీల కోటాను తనిఖీ చేయండి.")
 
-# 7. Inputs & Metadata
-tab_text, tab_file = st.tabs(["📋 Direct Paste Clean Questions", "📄 Upload Clean Text / PDF"])
-
+# 8. User Input Tabs
+tab_text, tab_file = st.tabs(["📋 Direct Paste GK Questions", "📄 Upload File (TXT/PDF)"])
 detected_meta = {"exam": "SSC CGL", "state": "Central", "date": "", "shift": ""}
 
 with tab_text:
     paper_title = st.text_input("Paper Title / Shift", placeholder="e.g. SSC_CGL_2024_09_12_Shift1")
-    pasted_input = st.text_area("Paste GK Questions (Text or JSON)", height=260, placeholder="Paste clean extracted questions here...")
+    pasted_input = st.text_area("Paste GK Questions (Text or JSON)", height=240, placeholder="Paste 25 clean questions here...")
     if paper_title:
         e, s, d, sh = parse_metadata_from_name(paper_title)
         detected_meta = {"exam": e, "state": s, "date": d, "shift": sh}
 
 with tab_file:
-    uploaded_file = st.file_uploader("Upload Question File (TXT or PDF)", type=["txt", "pdf"])
+    uploaded_file = st.file_uploader("Upload Question File", type=["txt", "pdf"])
     if uploaded_file:
         e, s, d, sh = parse_metadata_from_name(uploaded_file.name)
         detected_meta = {"exam": e, "state": s, "date": d, "shift": sh}
 
 # Sidebar Metadata
-st.sidebar.header("📝 Exam Details")
+st.sidebar.divider()
+st.sidebar.subheader("📝 Paper Details")
 manual_exam = st.sidebar.text_input("Exam Name", value=detected_meta["exam"])
 manual_state = st.sidebar.text_input("State", value=detected_meta["state"])
 manual_date = st.sidebar.text_input("Date", value=detected_meta["date"])
 manual_shift = st.sidebar.text_input("Shift", value=detected_meta["shift"])
 
-st.markdown("<br>", unsafe_allow_html=True)
-
-# 8. Step 1: Immediate Deterministic Parse & Gatekeeper
+# 9. Gatekeeper: Parse and Lock Unique Questions
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    btn_parse = st.button("🔍 1. Verify & Lock Question Count", type="primary", use_container_width=True)
+    btn_parse = st.button("🔍 1. Verify & Lock Clean Questions", type="primary", use_container_width=True)
 
 if btn_parse:
     raw_content = ""
@@ -319,92 +417,105 @@ if btn_parse:
             raw_content = uploaded_file.read().decode("utf-8")
 
     if not raw_content.strip():
-        st.warning("⚠️ దయచేసి టెక్స్ట్‌ను పేస్ట్ చేయండి లేదా ఫైల్‌ను అప్‌లోడ్ చేయండి.")
+        st.warning("⚠️ దయచేసి ప్రశ్నలను పేస్ట్ చేయండి లేదా ఫైల్ అప్‌లోడ్ చేయండి.")
     else:
-        parsed_items = parse_raw_text_to_questions(raw_content)
+        parsed_items = parse_incoming_input(raw_content)
         st.session_state["parsed_input_questions"] = parsed_items
         st.session_state["enriched_questions"] = []
         st.rerun()
 
-# 9. Gatekeeper & Step 2: 1-by-1 Safe Enrichment Engine
+# 10. Enrichment Trigger & Preview
 if st.session_state["parsed_input_questions"]:
     parsed_list = st.session_state["parsed_input_questions"]
     total_q = len(parsed_list)
-    
-    st.success(f"🎯 **Exact Questions Found & Locked: `{total_q}`** (Zero missing, Zero drop guarantee)")
-    
-    with st.expander(f"📋 Review Locked Questions ({total_q} Items)", expanded=False):
-        for item in parsed_list:
-            st.markdown(f"**Q{item.get('id')}:** {item.get('raw_block', item)[:120]}...")
-            st.caption(f"Detected Answer: `{item.get('detected_answer')}`")
-            st.divider()
+
+    st.success(f"🎯 **Locked Unique Questions: `{total_q}`** (Zero Duplicates Verified)")
 
     with col2:
-        btn_start_enrich = st.button(f"⚡ 2. Start Safe Enrichment ({total_q} Questions)", type="primary", use_container_width=True)
+        btn_start_enrich = st.button(f"🚀 2. Run Waterfall Batch Enrichment ({total_q} Questions)", type="primary", use_container_width=True)
 
     if btn_start_enrich:
         status_box = st.empty()
         live_box = st.empty()
-        prog = st.progress(0)
-        
-        results = []
-        for idx, q_item in enumerate(parsed_list):
-            q_num = idx + 1
-            status_box.markdown(f"⏳ **Enriching Question {q_num} of {total_q}...**")
-            
-            try:
-                enriched_obj = enrich_single_question_safely(q_item, live_box)
-                enriched_obj["id"] = q_num
-                results.append(enriched_obj)
-            except Exception as e:
-                st.error(f"Error at Question {q_num}: {e}")
-                break
-                
-            prog.progress(q_num / total_q)
-            time.sleep(0.2)
 
-        st.session_state["enriched_questions"] = results
-        status_box.empty()
-        live_box.empty()
-        st.success(f"🎉 100% Success! All {len(results)}/{total_q} Questions Enriched with 3 Languages & 4-Level Meta-Tags.")
+        status_box.markdown(f"⏳ **Processing All {total_q} Questions via Waterfall Engine...**")
+        start_time = time.time()
 
-# 10. Preview & Supabase Direct Ingestion
+        try:
+            enriched_results = process_full_batch(parsed_list, live_box)
+
+            # Map into Final Database Object (100% Intact Schema)
+            final_data = []
+            seen_final_ids = set()
+            for idx, item in enumerate(enriched_results):
+                orig_item = parsed_list[idx] if idx < len(parsed_list) else {}
+                qid = idx + 1
+                if qid not in seen_final_ids:
+                    seen_final_ids.add(qid)
+                    final_data.append({
+                        "id": qid,
+                        "question": item.get("question") or orig_item.get("question"),
+                        "options": item.get("options") or orig_item.get("options"),
+                        "correct_answer": item.get("correct_answer") or orig_item.get("correct_answer"),
+                        "meta_tags": item.get("meta_tags"),
+                        "explanation": item.get("explanation")
+                    })
+
+            elapsed = round(time.time() - start_time, 2)
+            st.session_state["enriched_questions"] = final_data
+            status_box.empty()
+            live_box.empty()
+            st.success(f"🎉 Complete! All {len(final_data)} Questions Enriched in {elapsed}s.")
+            st.rerun()
+
+        except Exception as e:
+            status_box.empty()
+            live_box.empty()
+            st.error(f"Processing Error: {e}")
+
+# 11. Multilingual Review & Supabase Direct Ingestion (100% Immutable Format)
 if st.session_state["enriched_questions"]:
     data = st.session_state["enriched_questions"]
     st.subheader(f"📊 Ready for Database ({len(data)} GK Questions)")
 
-    tab_prev, tab_json = st.tabs(["📋 Multilingual Preview", "📄 JSON"])
+    tab_prev, tab_json, tab_audit = st.tabs(["📋 Multilingual Preview", "📄 Raw JSON", "⏱️ Live Audit Log"])
 
     with tab_prev:
         for idx, q in enumerate(data):
-            q_en = q.get("question", {}).get("en", "")
-            with st.expander(f"Q{idx+1}: {q_en[:95]}..."):
+            q_en = (q.get("question") or {}).get("en", "")
+            with st.expander(f"Q{idx+1}: {str(q_en)[:95]}..."):
                 l1, l2, l3 = st.tabs(["🇬🇧 English", "🇮🇳 Telugu", "🇮🇳 Hindi"])
                 with l1:
-                    st.markdown(f"**Question:** {q.get('question', {}).get('en')}")
-                    st.write("**Options:**", q.get("options", {}).get("en"))
-                    st.info(f"**Explanation:** {q.get('explanation', {}).get('en')}")
+                    st.markdown(f"**Question:** {(q.get('question') or {}).get('en')}")
+                    st.write("**Options:**", (q.get("options") or {}).get("en"))
+                    st.info(f"**Explanation:** {(q.get('explanation') or {}).get('en')}")
                 with l2:
-                    st.markdown(f"**ప్రశ్న:** {q.get('question', {}).get('te')}")
-                    st.write("**ఆప్షన్లు:**", q.get("options", {}).get("te"))
-                    st.info(f"**వివరణ:** {q.get('explanation', {}).get('te')}")
+                    st.markdown(f"**ప్రశ్న:** {(q.get('question') or {}).get('te')}")
+                    st.write("**ఆప్షన్లు:**", (q.get("options") or {}).get("te"))
+                    st.info(f"**వివరణ:** {(q.get('explanation') or {}).get('te')}")
                 with l3:
-                    st.markdown(f"**प्रश्न:** {q.get('question', {}).get('hi')}")
-                    st.write("**विकल्प:**", q.get("options", {}).get("hi"))
-                    st.info(f"**व्याख्या:** {q.get('explanation', {}).get('hi')}")
-                
+                    st.markdown(f"**प्रश्न:** {(q.get('question') or {}).get('hi')}")
+                    st.write("**विकल्प:**", (q.get("options") or {}).get("hi"))
+                    st.info(f"**व्याख्या:** {(q.get('explanation') or {}).get('hi')}")
+
                 st.write(f"**Correct Answer:** `{q.get('correct_answer')}`")
                 st.write("**4-Level Meta-Tags:**", q.get("meta_tags", []))
 
     with tab_json:
         st.json(data)
 
+    with tab_audit:
+        if st.session_state["audit_logs"]:
+            st.dataframe(pd.DataFrame(st.session_state["audit_logs"]), use_container_width=True)
+        else:
+            st.caption("No batch executions logged yet.")
+
     st.divider()
     if st.button("💾 Push All Questions to Supabase Database", type="primary", use_container_width=True):
         if not supabase:
             st.error("Supabase client is not connected.")
         else:
-            with st.spinner("Saving directly to Supabase..."):
+            with st.spinner("Writing directly to Supabase..."):
                 rows = []
                 for q in data:
                     rows.append({
@@ -418,10 +529,20 @@ if st.session_state["enriched_questions"]:
                         "meta_tags": q.get("meta_tags"),
                         "explanation": q.get("explanation")
                     })
-                try:
-                    for i in range(0, len(rows), 50):
-                        batch = rows[i:i + 50]
-                        supabase.table("gk_questions").insert(batch).execute()
-                    st.success(f"🎉 Success! All {len(rows)} Questions pushed to Supabase.")
-                except Exception as err:
-                    st.error(f"Database error: {err}")
+
+                # Safe Batch Insert (with automatic retries)
+                success = False
+                for attempt in range(1, 4):
+                    try:
+                        for i in range(0, len(rows), 25):
+                            batch = rows[i:i + 25]
+                            supabase.table("gk_questions").insert(batch).execute()
+                        st.success(f"🎉 Success! All {len(rows)} Unique Questions pushed to Supabase.")
+                        success = True
+                        break
+                    except Exception as err:
+                        if attempt < 3:
+                            st.warning(f"⚠️ డేటాబేస్ రీట్రై ({attempt}/3)... 2 సెకన్లు వేచిచూస్తున్నాం.")
+                            time.sleep(2)
+                        else:
+                            st.error(f"Database error: {err}")
