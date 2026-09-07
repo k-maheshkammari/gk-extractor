@@ -1,0 +1,79 @@
+{
+  "date": "2026-09-06",
+  "calls_made": {
+    "0": 7,
+    "1": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0
+  },
+  "token_metrics": {
+    "last_input_tokens": 7599,
+    "last_output_tokens": 16057,
+    "last_total_tokens": 32027,
+    "session_total_tokens": 199584
+  },
+  "audit_logs": [
+    {
+      "time": "17:22:13",
+      "key": "Key 1 (...ICjB9A)",
+      "questions": 25,
+      "tokens": 14645,
+      "duration": "109.42s",
+      "status": "SUCCESS"
+    },
+    {
+      "time": "20:38:39",
+      "key": "Key 1 (...ICjB9A)",
+      "questions": 25,
+      "tokens": 15900,
+      "duration": "99.2s",
+      "status": "SUCCESS"
+    },
+    {
+      "time": "20:41:06",
+      "key": "Key 1 (...ICjB9A)",
+      "questions": 25,
+      "tokens": 15984,
+      "duration": "74.68s",
+      "status": "SUCCESS"
+    },
+    {
+      "time": "20:43:58",
+      "key": "Key 1 (...ICjB9A)",
+      "questions": 25,
+      "tokens": 16611,
+      "duration": "100.36s",
+      "status": "SUCCESS"
+    },
+    {
+      "time": "20:47:49",
+      "key": "Key 1 (...ICjB9A)",
+      "questions": 25,
+      "tokens": 15981,
+      "duration": "109.3s",
+      "status": "SUCCESS"
+    },
+    {
+      "time": "20:50:53",
+      "key": "Key 1 (...ICjB9A)",
+      "questions": 25,
+      "tokens": 16572,
+      "duration": "96.46s",
+      "status": "SUCCESS"
+    },
+    {
+      "time": "20:57:49",
+      "key": "Key 1 (...ICjB9A)",
+      "questions": 25,
+      "tokens": 16057,
+      "duration": "114.24s",
+      "status": "SUCCESS"
+    }
+  ]
+}

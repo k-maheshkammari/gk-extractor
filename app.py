@@ -17,7 +17,7 @@ from google.genai import types
 from supabase import create_client, Client
 from pypdf import PdfReader
 
-# 1. Environment Loading (.env and Streamlit Cloud Secrets)
+# 1. Environment Loading (.env & Streamlit Secrets)
 load_dotenv(find_dotenv(), override=True)
 
 gemini_keys_raw = []
@@ -40,9 +40,8 @@ if SUPABASE_URL and SUPABASE_KEY:
         st.error(f"Supabase Connection Error: {e}")
 
 DAILY_LIMIT_PER_KEY = 20
-TRACKER_FILE = "quota_tracker.json"
 
-# Google AI Studio Reset Cycle: US/Pacific Timezone (PT Midnight ~ 12:30 PM IST)
+# Google Daily Reset: US/Pacific Timezone (12:30 PM IST)
 def get_google_quota_date():
     if ZoneInfo:
         try:
@@ -51,62 +50,96 @@ def get_google_quota_date():
             pass
     return datetime.now(timezone(timedelta(hours=-7))).strftime("%Y-%m-%d")
 
-# 2. Daily Persistence Engine (Preserves calls & tokens on Refresh/Restart/Mobile)
-def load_tracker():
+def get_key_display(idx):
+    k = gemini_keys_raw[idx]
+    return f"Key {idx + 1} (...{k[-6:]})"
+
+# 2. 100% Centralized Cloud Persistence (No Local Files)
+def fetch_cloud_telemetry():
     google_today = get_google_quota_date()
-    default_data = {
-        "date": google_today,
-        "calls_made": {str(i): 0 for i in range(len(gemini_keys_raw))},
-        "token_metrics": {
-            "last_input_tokens": 0,
-            "last_output_tokens": 0,
-            "last_total_tokens": 0,
-            "session_total_tokens": 0
-        },
-        "audit_logs": []
+    status_map = {}
+    tokens = {
+        "last_input_tokens": 0,
+        "last_output_tokens": 0,
+        "last_total_tokens": 0,
+        "session_total_tokens": 0
     }
-    if os.path.exists(TRACKER_FILE):
+    
+    if supabase:
         try:
-            with open(TRACKER_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if data.get("date") == google_today:
-                    return data
-        except Exception:
-            pass
-    return default_data
+            res = supabase.table("key_quota_tracker").select("*").execute()
+            rows = res.data or []
+            existing = {r["key_index"]: r for r in rows}
 
-def save_tracker():
+            tot_sess_tokens = 0
+            for i in range(len(gemini_keys_raw)):
+                k_name = get_key_display(i)
+                if i in existing and existing[i].get("quota_date") == google_today:
+                    row = existing[i]
+                    status_map[i] = {
+                        "calls_made": row.get("calls_made", 0),
+                        "cooldown_until": row.get("cooldown_until", 0.0),
+                        "exhausted": row.get("calls_made", 0) >= DAILY_LIMIT_PER_KEY
+                    }
+                    tot_sess_tokens += row.get("session_total_tokens", 0)
+                    if row.get("last_total_tokens", 0) > tokens["last_total_tokens"]:
+                        tokens["last_input_tokens"] = row.get("last_input_tokens", 0)
+                        tokens["last_output_tokens"] = row.get("last_output_tokens", 0)
+                        tokens["last_total_tokens"] = row.get("last_total_tokens", 0)
+                else:
+                    # New day or first run: Initialize in Supabase
+                    supabase.table("key_quota_tracker").upsert({
+                        "key_index": i,
+                        "key_name": k_name,
+                        "quota_date": google_today,
+                        "calls_made": 0,
+                        "cooldown_until": 0.0,
+                        "last_input_tokens": 0,
+                        "last_output_tokens": 0,
+                        "last_total_tokens": 0,
+                        "session_total_tokens": 0
+                    }).execute()
+                    status_map[i] = {"calls_made": 0, "cooldown_until": 0.0, "exhausted": False}
+            tokens["session_total_tokens"] = tot_sess_tokens
+            return status_map, tokens
+        except Exception as err:
+            st.sidebar.error(f"Supabase Sync Notice: {err}")
+
+    for i in range(len(gemini_keys_raw)):
+        status_map[i] = {"calls_made": 0, "cooldown_until": 0.0, "exhausted": False}
+    return status_map, tokens
+
+def push_cloud_update(idx, calls_made, cooldown_until=0.0, inp_t=0, out_t=0, tot_t=0):
     google_today = get_google_quota_date()
-    data_to_save = {
-        "date": google_today,
-        "calls_made": {str(i): st.session_state["key_status"][i]["calls_made"] for i in range(len(gemini_keys_raw))},
-        "token_metrics": st.session_state["token_metrics"],
-        "audit_logs": st.session_state["audit_logs"][-50:]
+    k_name = get_key_display(idx)
+    payload = {
+        "key_index": idx,
+        "key_name": k_name,
+        "quota_date": google_today,
+        "calls_made": calls_made,
+        "cooldown_until": cooldown_until
     }
-    try:
-        with open(TRACKER_FILE, "w", encoding="utf-8") as f:
-            json.dump(data_to_save, f, indent=2)
-    except Exception:
-        pass
+    if tot_t > 0:
+        payload["last_input_tokens"] = inp_t
+        payload["last_output_tokens"] = out_t
+        payload["last_total_tokens"] = tot_t
+        # Increment session tokens for this key
+        cur_sess = st.session_state["token_metrics"]["session_total_tokens"] + tot_t
+        payload["session_total_tokens"] = cur_sess
 
-# Initialize session state from persistence file
-saved_data = load_tracker()
+    if supabase:
+        try:
+            supabase.table("key_quota_tracker").upsert(payload).execute()
+        except Exception as err:
+            st.error(f"Cloud Quota Update Failed: {err}")
 
-if "key_status" not in st.session_state:
-    st.session_state["key_status"] = {
-        i: {
-            "exhausted": saved_data["calls_made"].get(str(i), 0) >= DAILY_LIMIT_PER_KEY,
-            "calls_made": saved_data["calls_made"].get(str(i), 0),
-            "last_error": None
-        }
-        for i in range(len(gemini_keys_raw))
-    }
-
-if "token_metrics" not in st.session_state:
-    st.session_state["token_metrics"] = saved_data["token_metrics"]
+# Load live telemetry from Supabase Cloud on every render
+cloud_status, cloud_tokens = fetch_cloud_telemetry()
+st.session_state["key_status"] = cloud_status
+st.session_state["token_metrics"] = cloud_tokens
 
 if "audit_logs" not in st.session_state:
-    st.session_state["audit_logs"] = saved_data["audit_logs"]
+    st.session_state["audit_logs"] = []
 
 if "parsed_input_questions" not in st.session_state:
     st.session_state["parsed_input_questions"] = []
@@ -117,36 +150,32 @@ if "enriched_questions" not in st.session_state:
 if "visible_count" not in st.session_state:
     st.session_state["visible_count"] = 10
 
-def get_key_display(idx):
-    k = gemini_keys_raw[idx]
-    return f"Key {idx + 1} (...{k[-6:]})"
-
-# Strict Waterfall Key Selection: Exhausts Key 1 completely before Key 2
 def get_current_waterfall_client():
+    now = time.time()
     for idx in range(len(gemini_keys_raw)):
         status = st.session_state["key_status"][idx]
-        if not status["exhausted"] and status["calls_made"] < DAILY_LIMIT_PER_KEY:
+        is_exhausted = status["calls_made"] >= DAILY_LIMIT_PER_KEY
+        is_cooling = status.get("cooldown_until", 0.0) > now
+        if not is_exhausted and not is_cooling:
             selected_key = gemini_keys_raw[idx]
             return genai.Client(api_key=selected_key), idx, get_key_display(idx)
     return None, None, None
 
-# 3. UI Layout & Sidebar Live Transparency Center
-st.set_page_config(page_title="SSC GK 25-Batch Turbo Engine", layout="wide")
-st.title("⚡ SSC GK Waterfall Batch Engine (Live Monitor)")
+# 3. UI Layout & Sidebar Live Monitor
+st.set_page_config(page_title="SSC GK 25-Batch Engine", layout="wide")
+st.title("⚡ SSC GK Waterfall Batch Engine (Cloud Synced)")
 
-st.sidebar.header("📊 Live API & Quota Monitor")
+st.sidebar.header("📊 Live Supabase API & Quota Monitor")
 
-# Determine Current Active Waterfall Key
 active_client, active_idx, active_name = get_current_waterfall_client()
 if active_name:
     calls_done = st.session_state["key_status"][active_idx]["calls_made"]
     st.sidebar.success(f"👉 **Running Key:** `{active_name}`")
     st.sidebar.progress(calls_done / DAILY_LIMIT_PER_KEY, text=f"Key Progress: {calls_done}/{DAILY_LIMIT_PER_KEY} Calls")
 else:
-    st.sidebar.error("❌ All Keys Quota Exhausted!")
+    st.sidebar.error("❌ All Keys currently cooling down or daily limits reached.")
 
-# Token Monitoring Dashboard
-st.sidebar.subheader("🎯 Live Token Tracker")
+st.sidebar.subheader("🎯 Live Cloud Token Tracker")
 t_met = st.session_state["token_metrics"]
 col_t1, col_t2 = st.sidebar.columns(2)
 with col_t1:
@@ -156,21 +185,25 @@ with col_t2:
 
 st.sidebar.caption(f"Input: `{t_met['last_input_tokens']:,}` | Session Total: `{t_met['session_total_tokens']:,}`")
 
-# Key-by-Key Waterfall Status
 st.sidebar.divider()
 st.sidebar.subheader("🔑 All Keys Status")
+now_t = time.time()
 for i in range(len(gemini_keys_raw)):
     status_info = st.session_state["key_status"][i]
     k_name = get_key_display(i)
     c_used = status_info["calls_made"]
+    cooling_left = int(status_info.get("cooldown_until", 0.0) - now_t)
+
     if status_info["exhausted"] or c_used >= DAILY_LIMIT_PER_KEY:
         st.sidebar.markdown(f"❌ **{k_name}**: `EXHAUSTED` ({c_used}/{DAILY_LIMIT_PER_KEY})")
+    elif cooling_left > 0:
+        st.sidebar.markdown(f"⏳ **{k_name}**: `COOLING` ({cooling_left}s left) ({c_used}/{DAILY_LIMIT_PER_KEY})")
     elif i == active_idx:
         st.sidebar.markdown(f"🟢 **{k_name}**: `ACTIVE RUNNER` ({c_used}/{DAILY_LIMIT_PER_KEY})")
     else:
         st.sidebar.markdown(f"⚪ **{k_name}**: `STANDBY` ({c_used}/{DAILY_LIMIT_PER_KEY})")
 
-# 4. Deterministic Parser with Robust Deduplication
+# 4. Helpers & Parser
 def clean_json_response(raw_text):
     text = raw_text.strip()
     match = re.search(r'\[\s*\{.*\}\s*\]', text, re.DOTALL)
@@ -238,7 +271,6 @@ def parse_metadata_from_name(name_str):
     shift = shift_match.group(0).replace("-", " ").title() if shift_match else ""
     return exam, state, date, shift
 
-# 5. Multilingual NCERT & Telugu Academy System Prompt
 batch25_system_prompt = """
 You are an expert Indian Competitive Exam Solution Engineer (NCERT & Telugu Academy standard).
 
@@ -272,18 +304,19 @@ OUTPUT FORMAT:
 ]
 """
 
-# 6. Waterfall API Processing Engine with Smart Cooldown & Quota Persistence
+# 5. Non-Destructive Processing Engine with Supabase Sync
 def process_full_batch(questions_list, live_box, max_retries=15):
     payload = json.dumps(questions_list, ensure_ascii=False)
     file_part = types.Part.from_bytes(data=payload.encode("utf-8"), mime_type="text/plain")
-    
-    # Track rate-limit hits per key to differentiate temporary minute spikes from daily limits
-    key_429_retries = {}
 
     for attempt in range(max_retries):
         client, key_idx, key_name = get_current_waterfall_client()
         if not client:
-            raise Exception("అన్ని API కీలలో డైలీ కోటా (20 RPD) పూర్తయింది.")
+            cool_times = [st.session_state["key_status"][i]["cooldown_until"] - time.time() for i in range(len(gemini_keys_raw)) if not st.session_state["key_status"][i]["exhausted"]]
+            wait_sec = max(int(min(cool_times)), 2) if cool_times else 10
+            live_box.warning(f"⏳ అన్ని కీలు కూల్‌డౌన్‌లో ఉన్నాయి. {wait_sec} సెకన్లు వేచిచూస్తున్నాం...")
+            time.sleep(wait_sec)
+            continue
 
         live_box.markdown(f"🔑 **Running:** `{key_name}` | 🔄 **Batch Size:** `{len(questions_list)} Qs` | Attempt `{attempt+1}`")
 
@@ -300,29 +333,22 @@ def process_full_batch(questions_list, live_box, max_retries=15):
             )
             duration = round(time.time() - start_t, 2)
             
-            # 1. Update Calls Counter
-            st.session_state["key_status"][key_idx]["calls_made"] += 1
-            if st.session_state["key_status"][key_idx]["calls_made"] >= DAILY_LIMIT_PER_KEY:
-                st.session_state["key_status"][key_idx]["exhausted"] = True
-
-            # 2. Extract Token Telemetry
+            # Extract Tokens
             usage = response.usage_metadata
             inp_tok = getattr(usage, "prompt_token_count", 0)
             out_tok = getattr(usage, "candidates_token_count", 0)
             tot_tok = getattr(usage, "total_token_count", 0)
 
-            st.session_state["token_metrics"]["last_input_tokens"] = inp_tok
-            st.session_state["token_metrics"]["last_output_tokens"] = out_tok
-            st.session_state["token_metrics"]["last_total_tokens"] = tot_tok
-            st.session_state["token_metrics"]["session_total_tokens"] += tot_tok
+            # Update Supabase Cloud with new call count and token metrics
+            new_calls = st.session_state["key_status"][key_idx]["calls_made"] + 1
+            push_cloud_update(key_idx, new_calls, cooldown_until=0.0, inp_t=inp_tok, out_t=out_tok, tot_t=tot_tok)
 
-            # 3. Check for MAX_TOKENS Truncation
             finish_reason = ""
             if response.candidates and len(response.candidates) > 0:
                 finish_reason = str(response.candidates[0].finish_reason)
 
             if "MAX_TOKENS" in finish_reason:
-                st.warning(f"⚠️ {key_name} వద్ద టోకెన్లు సరిపోలేదు (MAX_TOKENS). బ్యాచ్‌ను ఆటోమేటిక్‌గా రెండు భాగాలుగా విడదీస్తున్నాం...")
+                st.warning(f"⚠️ {key_name} వద్ద టోకెన్లు సరిపోలేదు. విభజిస్తున్నాం...")
                 mid = len(questions_list) // 2
                 batch_a = process_full_batch(questions_list[:mid], live_box, max_retries)
                 batch_b = process_full_batch(questions_list[mid:], live_box, max_retries)
@@ -334,10 +360,8 @@ def process_full_batch(questions_list, live_box, max_retries=15):
                     if qid not in seen_ids:
                         seen_ids.add(qid)
                         merged.append(q)
-                save_tracker()
                 return merged
 
-            # 4. Clean and Parse JSON
             clean_str = clean_json_response(response.text)
             if clean_str:
                 result = json.loads(clean_str)
@@ -350,38 +374,28 @@ def process_full_batch(questions_list, live_box, max_retries=15):
                         "duration": f"{duration}s",
                         "status": "SUCCESS"
                     })
-                    save_tracker()
                     return result
 
         except Exception as err:
             err_msg = str(err)
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                current_hits = key_429_retries.get(key_idx, 0) + 1
-                key_429_retries[key_idx] = current_hits
-                
-                # If hit once, it's a temporary minute-level traffic spike (TPM). Wait 6 seconds and retry with same key.
-                if current_hits < 2:
-                    st.warning(f"⏳ `{key_name}` వద్ద తాత్కాలిక నిమిషాల రద్దీ (TPM Limit). 6 సెకన్లు ఆగి మళ్లీ ప్రయత్నిస్తున్నాం...")
-                    time.sleep(6)
-                    continue
-                else:
-                    # Consecutive failure: Confirm actual daily quota limit and waterfall to next key
-                    st.session_state["key_status"][key_idx]["exhausted"] = True
-                    st.session_state["key_status"][key_idx]["calls_made"] = DAILY_LIMIT_PER_KEY
-                    save_tracker()
-                    st.warning(f"⚠️ `{key_name}` డైలీ కోటా తాకింది! వాటర్‌ఫాల్ ప్రకారం తర్వాతి కీకి బదిలీ చేస్తున్నాం...")
-                    time.sleep(1)
+                # 60-second cooldown without burning calls count
+                cool_expire = time.time() + 60.0
+                current_c = st.session_state["key_status"][key_idx]["calls_made"]
+                push_cloud_update(key_idx, current_c, cooldown_until=cool_expire)
+                live_box.warning(f"⏳ `{key_name}` వద్ద తాత్కాలిక నిమిషాల రద్దీ (TPM Limit). ఈ కీకి 60 సెకన్ల కూల్‌డౌన్ విధించి, తర్వాతి కీకి బదిలీ చేస్తున్నాం...")
+                time.sleep(2)
             elif "503" in err_msg or "UNAVAILABLE" in err_msg:
-                wait_t = min(3 * (attempt + 1), 10)
-                st.warning(f"⏳ సర్వర్ బిజీ (503). {wait_t} సెకన్లు వేచిచూస్తున్నాం...")
+                wait_t = min(3 * (attempt + 1), 12)
+                live_box.warning(f"⏳ సర్వర్ బిజీ (503). {wait_t} సెకన్లు వేచిచూస్తున్నాం...")
                 time.sleep(wait_t)
             else:
-                st.warning(f"⚠️ ఎర్రర్: {err_msg[:90]}... రీట్రై అవుతోంది...")
+                live_box.warning(f"⚠️ ఎర్రర్: {err_msg[:90]}... రీట్రై అవుతోంది...")
                 time.sleep(2)
 
-    raise Exception("25 ప్రశ్నల ప్రాసెసింగ్ పూర్తి కాలేదు. దయచేసి API కీల కోటాను తనిఖీ చేయండి.")
+    raise Exception("25 ప్రశ్నల ప్రాసెసింగ్ పూర్తి కాలేదు.")
 
-# 7. UI TABS: Direct Paste, Upload File, and Mobile Search Portal
+# 6. UI Tabs
 tab_text, tab_file, tab_search = st.tabs(["📋 Direct Paste GK Questions", "📄 Upload File (TXT/PDF)", "🔍 Search Database"])
 detected_meta = {"exam": "SSC CGL", "state": "Central", "date": "", "shift": ""}
 
@@ -470,7 +484,7 @@ manual_state = st.sidebar.text_input("State", value=detected_meta["state"])
 manual_date = st.sidebar.text_input("Date", value=detected_meta["date"])
 manual_shift = st.sidebar.text_input("Shift", value=detected_meta["shift"])
 
-# 8. Gatekeeper: Parse and Lock Unique Questions
+# 7. Gatekeeper
 col1, col2 = st.columns([1, 1])
 with col1:
     btn_parse = st.button("🔍 1. Verify & Lock Clean Questions", type="primary", use_container_width=True)
@@ -495,7 +509,7 @@ if btn_parse:
         st.session_state["enriched_questions"] = []
         st.rerun()
 
-# 9. Enrichment Trigger & Preview
+# 8. Enrichment Trigger
 if st.session_state["parsed_input_questions"]:
     parsed_list = st.session_state["parsed_input_questions"]
     total_q = len(parsed_list)
@@ -540,7 +554,7 @@ if st.session_state["parsed_input_questions"]:
             live_box.empty()
             st.error(f"Processing Error: {e}")
 
-# 10. Multilingual Review & Supabase Direct Ingestion
+# 9. Multilingual Review & Supabase Direct Ingestion
 if st.session_state["enriched_questions"]:
     data = st.session_state["enriched_questions"]
     st.subheader(f"📊 Ready for Database ({len(data)} GK Questions)")
@@ -602,7 +616,7 @@ if st.session_state["enriched_questions"]:
                             supabase.table("gk_questions").insert(batch).execute()
                         st.success(f"🎉 Success! All {len(rows)} Unique Questions pushed to Supabase.")
                         break
-                    except Exception as err: 
+                    except Exception as err:
                         if attempt < 3:
                             time.sleep(2)
                         else:
