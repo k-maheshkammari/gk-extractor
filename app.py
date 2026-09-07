@@ -3,6 +3,7 @@ import re
 import json
 import io
 import time
+import traceback
 from datetime import datetime, timezone, timedelta
 try:
     from zoneinfo import ZoneInfo
@@ -123,7 +124,6 @@ def push_cloud_update(idx, calls_made, cooldown_until=0.0, inp_t=0, out_t=0, tot
         payload["last_input_tokens"] = inp_t
         payload["last_output_tokens"] = out_t
         payload["last_total_tokens"] = tot_t
-        # Increment session tokens for this key
         cur_sess = st.session_state["token_metrics"]["session_total_tokens"] + tot_t
         payload["session_total_tokens"] = cur_sess
 
@@ -304,16 +304,19 @@ OUTPUT FORMAT:
 ]
 """
 
-# 5. Non-Destructive Processing Engine with Supabase Sync
+# 5. Non-Destructive Processing Engine with Complete Diagnostic Tracing
 def process_full_batch(questions_list, live_box, max_retries=15):
     payload = json.dumps(questions_list, ensure_ascii=False)
     file_part = types.Part.from_bytes(data=payload.encode("utf-8"), mime_type="text/plain")
+    
+    last_error_diagnostic = "ఎలాంటి కాల్ జరగలేదు లేదా ప్రారంభంలోనే కీలు అందుబాటులో లేవు."
 
     for attempt in range(max_retries):
         client, key_idx, key_name = get_current_waterfall_client()
         if not client:
             cool_times = [st.session_state["key_status"][i]["cooldown_until"] - time.time() for i in range(len(gemini_keys_raw)) if not st.session_state["key_status"][i]["exhausted"]]
             wait_sec = max(int(min(cool_times)), 2) if cool_times else 10
+            last_error_diagnostic = f"అన్ని కీలు కూల్‌డౌన్‌లో లేదా డైలీ లిమిట్ రీచ్ అయ్యాయి (Attempt {attempt+1}/{max_retries})."
             live_box.warning(f"⏳ అన్ని కీలు కూల్‌డౌన్‌లో ఉన్నాయి. {wait_sec} సెకన్లు వేచిచూస్తున్నాం...")
             time.sleep(wait_sec)
             continue
@@ -363,37 +366,51 @@ def process_full_batch(questions_list, live_box, max_retries=15):
                 return merged
 
             clean_str = clean_json_response(response.text)
-            if clean_str:
-                result = json.loads(clean_str)
-                if isinstance(result, list) and len(result) > 0:
-                    st.session_state["audit_logs"].append({
-                        "time": datetime.now().strftime("%H:%M:%S"),
-                        "key": key_name,
-                        "questions": len(questions_list),
-                        "tokens": out_tok,
-                        "duration": f"{duration}s",
-                        "status": "SUCCESS"
-                    })
-                    return result
+            if not clean_str:
+                raise ValueError(f"గూగుల్ నుండి రెస్పాన్స్ టెక్స్ట్ రాలేదు (Empty Text). Response Candidates: {response.candidates}")
+
+            result = json.loads(clean_str)
+            if isinstance(result, list) and len(result) > 0:
+                st.session_state["audit_logs"].append({
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "key": key_name,
+                    "questions": len(questions_list),
+                    "tokens": out_tok,
+                    "duration": f"{duration}s",
+                    "status": "SUCCESS"
+                })
+                return result
+            else:
+                raise ValueError(f"రెస్పాన్స్ JSON లిస్ట్ రూపంలో రాలేదు: {str(result)[:250]}")
 
         except Exception as err:
             err_msg = str(err)
+            tb_str = traceback.format_exc()
+            last_error_diagnostic = f"Key: {key_name} | Attempt: {attempt+1}\nError: {err_msg}\n\nFull Traceback:\n{tb_str}"
+            
+            # Print clearly in VS Code Console
+            print("\n" + "="*70)
+            print(f"🚨 [ATTEMPT {attempt+1} FAILED] ON KEY: {key_name}")
+            print(f"ERROR: {err_msg}")
+            traceback.print_exc()
+            print("="*70 + "\n")
+
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                # 60-second cooldown without burning calls count
                 cool_expire = time.time() + 60.0
                 current_c = st.session_state["key_status"][key_idx]["calls_made"]
                 push_cloud_update(key_idx, current_c, cooldown_until=cool_expire)
-                live_box.warning(f"⏳ `{key_name}` వద్ద తాత్కాలిక నిమిషాల రద్దీ (TPM Limit). ఈ కీకి 60 సెకన్ల కూల్‌డౌన్ విధించి, తర్వాతి కీకి బదిలీ చేస్తున్నాం...")
+                live_box.warning(f"⏳ `{key_name}` వద్ద తాత్కాలిక నిమిషాల రద్దీ (429 Limit). 60 సెకన్ల కూల్‌డౌన్ విధించి, తర్వాతి కీకి బదిలీ చేస్తున్నాం...")
                 time.sleep(2)
             elif "503" in err_msg or "UNAVAILABLE" in err_msg:
                 wait_t = min(3 * (attempt + 1), 12)
                 live_box.warning(f"⏳ సర్వర్ బిజీ (503). {wait_t} సెకన్లు వేచిచూస్తున్నాం...")
                 time.sleep(wait_t)
             else:
-                live_box.warning(f"⚠️ ఎర్రర్: {err_msg[:90]}... రీట్రై అవుతోంది...")
+                live_box.warning(f"⚠️ ఎర్రర్ ({key_name}): {err_msg[:90]}... రీట్రై అవుతోంది...")
                 time.sleep(2)
 
-    raise Exception("25 ప్రశ్నల ప్రాసెసింగ్ పూర్తి కాలేదు.")
+    # 15 Attempts ఫెయిల్ అయితే అసలైన కారణంతో ఎక్సెప్షన్ రేయిజ్ చేయబడుతుంది
+    raise Exception(f"25 ప్రశ్నల ప్రాసెసింగ్ 15 అటెంప్ట్‌ల తర్వాత కూడా పూర్తి కాలేదు.\n\nచివరి ఎర్రర్ డయాగ్నస్టిక్ వివరాలు:\n{last_error_diagnostic}")
 
 # 6. UI Tabs
 tab_text, tab_file, tab_search = st.tabs(["📋 Direct Paste GK Questions", "📄 Upload File (TXT/PDF)", "🔍 Search Database"])
@@ -509,7 +526,7 @@ if btn_parse:
         st.session_state["enriched_questions"] = []
         st.rerun()
 
-# 8. Enrichment Trigger
+# 8. Enrichment Trigger with Transparent Error Display
 if st.session_state["parsed_input_questions"]:
     parsed_list = st.session_state["parsed_input_questions"]
     total_q = len(parsed_list)
@@ -552,7 +569,12 @@ if st.session_state["parsed_input_questions"]:
         except Exception as e:
             status_box.empty()
             live_box.empty()
-            st.error(f"Processing Error: {e}")
+            st.error("🚨 Processing Failed! అసలైన ఎర్రర్ వివరాలు కింద ఉన్నాయి:")
+            st.code(str(e), language="text")
+            print("\n" + "#"*70)
+            print("🚨 UNCAUGHT PIPELINE EXCEPTION:")
+            traceback.print_exc()
+            print("#"*70 + "\n")
 
 # 9. Multilingual Review & Supabase Direct Ingestion
 if st.session_state["enriched_questions"]:
