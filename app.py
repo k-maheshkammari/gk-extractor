@@ -632,7 +632,7 @@ if st.session_state["enriched_questions"]:
                     })
 
                 for attempt in range(1, 4):
-                    try:
+                    try:  
                         for i in range(0, len(rows), 25):
                             batch = rows[i:i + 25]
                             supabase.table("gk_questions").insert(batch).execute()
