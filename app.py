@@ -88,7 +88,6 @@ def fetch_cloud_telemetry():
                         tokens["last_output_tokens"] = row.get("last_output_tokens", 0)
                         tokens["last_total_tokens"] = row.get("last_total_tokens", 0)
                 else:
-                    # New day or first run: Initialize in Supabase
                     supabase.table("key_quota_tracker").upsert({
                         "key_index": i,
                         "key_name": k_name,
@@ -150,8 +149,20 @@ if "enriched_questions" not in st.session_state:
 if "visible_count" not in st.session_state:
     st.session_state["visible_count"] = 10
 
+if "manual_key_override" not in st.session_state:
+    st.session_state["manual_key_override"] = "Auto (Waterfall)"
+
 def get_current_waterfall_client():
     now = time.time()
+    
+    # Check for manual override key selection
+    override = st.session_state.get("manual_key_override", "Auto (Waterfall)")
+    if override != "Auto (Waterfall)":
+        for idx in range(len(gemini_keys_raw)):
+            if get_key_display(idx) == override:
+                return genai.Client(api_key=gemini_keys_raw[idx]), idx, get_key_display(idx)
+
+    # Default Waterfall selection logic
     for idx in range(len(gemini_keys_raw)):
         status = st.session_state["key_status"][idx]
         is_exhausted = status["calls_made"] >= DAILY_LIMIT_PER_KEY
@@ -174,6 +185,13 @@ if active_name:
     st.sidebar.progress(calls_done / DAILY_LIMIT_PER_KEY, text=f"Key Progress: {calls_done}/{DAILY_LIMIT_PER_KEY} Calls")
 else:
     st.sidebar.error("❌ All Keys currently cooling down or daily limits reached.")
+
+# Manual Key Control Dropdown
+st.sidebar.divider()
+st.sidebar.subheader("🎛️ Manual Key Control")
+key_options = ["Auto (Waterfall)"] + [get_key_display(i) for i in range(len(gemini_keys_raw))]
+selected_manual = st.sidebar.selectbox("Force Override Key", key_options)
+st.session_state["manual_key_override"] = selected_manual
 
 st.sidebar.subheader("🎯 Live Cloud Token Tracker")
 t_met = st.session_state["token_metrics"]
@@ -304,7 +322,7 @@ OUTPUT FORMAT:
 ]
 """
 
-# 5. Non-Destructive Processing Engine with Complete Diagnostic Tracing
+# 5. Non-Destructive Processing Engine with Pacing & Diagnostic Tracing
 def process_full_batch(questions_list, live_box, max_retries=15):
     payload = json.dumps(questions_list, ensure_ascii=False)
     file_part = types.Part.from_bytes(data=payload.encode("utf-8"), mime_type="text/plain")
@@ -320,6 +338,9 @@ def process_full_batch(questions_list, live_box, max_retries=15):
             live_box.warning(f"⏳ అన్ని కీలు కూల్‌డౌన్‌లో ఉన్నాయి. {wait_sec} సెకన్లు వేచిచూస్తున్నాం...")
             time.sleep(wait_sec)
             continue
+
+        # Pre-emptive pacing to prevent burst throttling
+        time.sleep(3)
 
         live_box.markdown(f"🔑 **Running:** `{key_name}` | 🔄 **Batch Size:** `{len(questions_list)} Qs` | Attempt `{attempt+1}`")
 
@@ -388,7 +409,6 @@ def process_full_batch(questions_list, live_box, max_retries=15):
             tb_str = traceback.format_exc()
             last_error_diagnostic = f"Key: {key_name} | Attempt: {attempt+1}\nError: {err_msg}\n\nFull Traceback:\n{tb_str}"
             
-            # Print clearly in VS Code Console
             print("\n" + "="*70)
             print(f"🚨 [ATTEMPT {attempt+1} FAILED] ON KEY: {key_name}")
             print(f"ERROR: {err_msg}")
@@ -409,7 +429,6 @@ def process_full_batch(questions_list, live_box, max_retries=15):
                 live_box.warning(f"⚠️ ఎర్రర్ ({key_name}): {err_msg[:90]}... రీట్రై అవుతోంది...")
                 time.sleep(2)
 
-    # 15 Attempts ఫెయిల్ అయితే అసలైన కారణంతో ఎక్సెప్షన్ రేయిజ్ చేయబడుతుంది
     raise Exception(f"25 ప్రశ్నల ప్రాసెసింగ్ 15 అటెంప్ట్‌ల తర్వాత కూడా పూర్తి కాలేదు.\n\nచివరి ఎర్రర్ డయాగ్నస్టిక్ వివరాలు:\n{last_error_diagnostic}")
 
 # 6. UI Tabs
@@ -632,7 +651,7 @@ if st.session_state["enriched_questions"]:
                     })
 
                 for attempt in range(1, 4):
-                    try:  
+                    try:
                         for i in range(0, len(rows), 25):
                             batch = rows[i:i + 25]
                             supabase.table("gk_questions").insert(batch).execute()
