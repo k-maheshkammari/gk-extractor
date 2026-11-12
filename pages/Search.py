@@ -165,30 +165,76 @@ EXAM_CATEGORIES = {
     }
 }
 
-# 5. డేటాబేస్ సెర్చ్ ఫంక్షన్
+# 5. డేటాబేస్ సెర్చ్ ఫంక్షన్ (Advanced & Fast JSON Targeting)
 def search_questions(search_term: str, exam_filter: str, limit: int = 10):
     try:
         client = get_supabase_client()
         if not client:
             return [], 0
         
-        response = client.rpc(
-            "search_gk_portal",
-            {
-                "search_term": search_term.strip().lower(),
-                "exam_filter": exam_filter if exam_filter else "All Exams",
-                "page_limit": limit,
-                "page_offset": 0
-            }
-        ).execute()
+        kw = search_term.strip().lower()
         
-        data = response.data or []
-        total_count = data[0]["total_count"] if data else 0
+        query = client.table("gk_questions").select("*", count="exact")
+        
+        if exam_filter and exam_filter != "All Exams":
+            query = query.ilike("exam_name", f"%{exam_filter}%")
+        
+        if kw:
+            # JSON లోపల ఉన్న ప్రతి భాషను, 4 మెటా-ట్యాగ్స్ ను విడివిడిగా వెతికే పర్ఫెక్ట్ లాజిక్
+            or_condition = (
+                f"question->>en.ilike.%{kw}%,"
+                f"question->>te.ilike.%{kw}%,"
+                f"question->>hi.ilike.%{kw}%,"
+                f"options->>en.ilike.%{kw}%,"
+                f"options->>te.ilike.%{kw}%,"
+                f"options->>hi.ilike.%{kw}%,"
+                f"meta_tags->>0.ilike.%{kw}%,"
+                f"meta_tags->>1.ilike.%{kw}%,"
+                f"meta_tags->>2.ilike.%{kw}%,"
+                f"meta_tags->>3.ilike.%{kw}%"
+            )
+            query = query.or_(or_condition)
+
+        res = query.order("created_at", desc=True).limit(limit).execute()
+        
+        data = res.data or []
+        total_count = res.count if res.count is not None else len(data)
+        
         return data, total_count
     except Exception as e:
         st.error(f"Search Error: {e}")
         return [], 0
+    try:
+        client = get_supabase_client()
+        if not client:
+            return [], 0
+        
+        kw = search_term.strip().lower()
+        
+        query = client.table("gk_questions").select("*", count="exact")
+        
+        if exam_filter and exam_filter != "All Exams":
+            query = query.ilike("exam_name", f"%{exam_filter}%")
+        
+        if kw:
+            or_condition = (
+                f"question->>en.ilike.%{kw}%,"
+                f"question->>te.ilike.%{kw}%,"
+                f"question->>hi.ilike.%{kw}%,"
+                f"options::text.ilike.%{kw}%,"
+                f"meta_tags::text.ilike.%{kw}%"
+            )
+            query = query.or_(or_condition)
 
+        res = query.order("created_at", desc=True).limit(limit).execute()
+        
+        data = res.data or []
+        total_count = res.count if res.count is not None else len(data)
+        
+        return data, total_count
+    except Exception as e:
+        st.error(f"Search Error: {e}")
+        return [], 0
 # 6. టాప్ బార్ (Title + VocabCraft Themes + Filter Popover + Dark Mode)
 c_head, c_filter, c_theme, c_mode = st.columns([4.5, 2, 2.5, 1])
 

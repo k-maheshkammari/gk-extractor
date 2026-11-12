@@ -173,7 +173,7 @@ def get_current_waterfall_client():
     return None, None, None
 
 # 3. UI Layout & Sidebar Live Monitor
-st.set_page_config(page_title="SSC GK 25-Batch Engine", layout="wide")
+st.set_page_config(page_title="SSC GK 45-Batch Engine", layout="wide")
 st.title("⚡ SSC GK Waterfall Batch Engine (Cloud Synced)")
 
 st.sidebar.header("📊 Live Supabase API & Quota Monitor")
@@ -289,11 +289,11 @@ def parse_metadata_from_name(name_str):
     shift = shift_match.group(0).replace("-", " ").title() if shift_match else ""
     return exam, state, date, shift
 
-batch25_system_prompt = """
+batch45_system_prompt = """
 You are an expert Indian Competitive Exam Solution Engineer (NCERT & Telugu Academy standard).
 
 TASK:
-You are provided with a batch of up to 25 clean GK questions.
+You are provided with a batch of up to 45 clean GK questions.
 For EVERY question, you must return:
 1. "id": Matching the exact ID provided.
 2. "meta_tags": Exactly 4 hierarchical levels:
@@ -350,7 +350,7 @@ def process_full_batch(questions_list, live_box, max_retries=15):
                 model="gemini-3.6-flash",
                 contents=[file_part, f"Enrich all {len(questions_list)} questions with 4-level meta-tags, 3-language explanations, and strict JSON format."],
                 config=types.GenerateContentConfig(
-                    system_instruction=batch25_system_prompt,
+                    system_instruction=batch45_system_prompt,
                     response_mime_type="application/json",
                     temperature=0.0
                 )
@@ -429,7 +429,7 @@ def process_full_batch(questions_list, live_box, max_retries=15):
                 live_box.warning(f"⚠️ ఎర్రర్ ({key_name}): {err_msg[:90]}... రీట్రై అవుతోంది...")
                 time.sleep(2)
 
-    raise Exception(f"25 ప్రశ్నల ప్రాసెసింగ్ 15 అటెంప్ట్‌ల తర్వాత కూడా పూర్తి కాలేదు.\n\nచివరి ఎర్రర్ డయాగ్నస్టిక్ వివరాలు:\n{last_error_diagnostic}")
+    raise Exception(f"45 ప్రశ్నల ప్రాసెసింగ్ 15 అటెంప్ట్‌ల తర్వాత కూడా పూర్తి కాలేదు.\n\nచివరి ఎర్రర్ డయాగ్నస్టిక్ వివరాలు:\n{last_error_diagnostic}")
 
 # 6. UI Tabs
 tab_text, tab_file, tab_search = st.tabs(["📋 Direct Paste GK Questions", "📄 Upload File (TXT/PDF)", "🔍 Search Database"])
@@ -437,7 +437,7 @@ detected_meta = {"exam": "SSC CGL", "state": "Central", "date": "", "shift": ""}
 
 with tab_text:
     paper_title = st.text_input("Paper Title / Shift", placeholder="e.g. SSC_CGL_2024_09_12_Shift1")
-    pasted_input = st.text_area("Paste GK Questions (Text or JSON)", height=240, placeholder="Paste 25 clean questions here...")
+    pasted_input = st.text_area("Paste GK Questions (Text or JSON)", height=240, placeholder="Paste 45 clean questions here...")
     if paper_title:
         e, s, d, sh = parse_metadata_from_name(paper_title)
         detected_meta = {"exam": e, "state": s, "date": d, "shift": sh}
@@ -652,8 +652,8 @@ if st.session_state["enriched_questions"]:
 
                 for attempt in range(1, 4):
                     try:
-                        for i in range(0, len(rows), 25):
-                            batch = rows[i:i + 25]
+                        for i in range(0, len(rows), 45):
+                            batch = rows[i:i + 45]
                             supabase.table("gk_questions").insert(batch).execute()
                         st.success(f"🎉 Success! All {len(rows)} Unique Questions pushed to Supabase.")
                         break
